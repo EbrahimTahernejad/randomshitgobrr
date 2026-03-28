@@ -88,7 +88,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	}
 	log.Printf("client ID %s", pconn.ClientID())
 
-	conn, err := kcp.NewConn2(turbotunnel.DummyAddr{}, nil, 0, 0, pconn)
+	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
 	if err != nil {
 		return fmt.Errorf("KCP conn: %v", err)
 	}
