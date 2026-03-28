@@ -252,7 +252,7 @@ func (st *ServerTransport) sendICMPSpoofed(payload []byte, dstIP net.IP) error {
 		DstIP:    net.IP(dst4),
 	}
 	icmpLayer := &layers.ICMPv4{
-		TypeCode: layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoRequest, 0),
+		TypeCode: layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoReply, 0),
 		Id:       IcmpID,
 		Seq:      seq,
 	}
@@ -272,7 +272,7 @@ func (st *ServerTransport) sendICMPSpoofed(payload []byte, dstIP net.IP) error {
 func (st *ServerTransport) sendICMPNormal(payload []byte, dstIP net.IP) error {
 	seq := uint16(st.icmpSeq.Add(1))
 	msg := &icmp.Message{
-		Type: ipv4.ICMPTypeEcho,
+		Type: ipv4.ICMPTypeEchoReply,
 		Code: 0,
 		Body: &icmp.Echo{
 			ID:   IcmpID,

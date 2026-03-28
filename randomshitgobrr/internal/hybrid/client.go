@@ -1,6 +1,6 @@
 // Package hybrid implements a split transport:
 // upstream (client→server) via DNS TXT queries,
-// downstream (server→client) via ICMP Echo Requests with spoofed source IP.
+// downstream (server→client) via ICMP Echo Replies.
 package hybrid
 
 import (
@@ -106,7 +106,7 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 		if err != nil {
 			continue
 		}
-		if msg.Type != ipv4.ICMPTypeEcho {
+		if msg.Type != ipv4.ICMPTypeEchoReply {
 			continue
 		}
 		echo, ok := msg.Body.(*icmp.Echo)
@@ -122,6 +122,7 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 		if pktID != c.clientID {
 			continue
 		}
+		log.Printf("icmpRecvLoop: tunnel pkt id=%#x data=%d bytes", echo.ID, len(data))
 
 		// Unpack length-prefixed KCP packets from the ICMP payload.
 		r := bytes.NewReader(data[8:])
