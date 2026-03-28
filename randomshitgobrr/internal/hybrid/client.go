@@ -1,6 +1,6 @@
 // Package hybrid implements a split transport:
 // upstream (client→server) via DNS TXT queries,
-// downstream (server→client) via ICMP Echo Replies.
+// downstream (server→client) via ICMP Echo Requests with spoofed source IP.
 package hybrid
 
 import (
@@ -96,33 +96,47 @@ func (c *ClientConn) ClientID() turbotunnel.ClientID { return c.clientID }
 // 8-byte ClientID prefix in the payload, then unpacks bundled KCP packets
 // and queues them for KCP to read.
 func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
+	log.Printf("icmpRecvLoop: started, listening for ICMP (clientID=%s)", c.clientID)
 	buf := make([]byte, 65536)
 	for {
-		n, _, _, err := conn.IPv4PacketConn().ReadFrom(buf)
+		n, _, src, err := conn.IPv4PacketConn().ReadFrom(buf)
 		if err != nil {
 			return err
 		}
+		log.Printf("icmpRecvLoop: raw recv %d bytes from %v", n, src)
+
 		msg, err := icmp.ParseMessage(1, buf[:n])
 		if err != nil {
+			log.Printf("icmpRecvLoop: parse error: %v", err)
 			continue
 		}
-		if msg.Type != ipv4.ICMPTypeEchoReply {
+		log.Printf("icmpRecvLoop: type=%v", msg.Type)
+
+		if msg.Type != ipv4.ICMPTypeEcho {
 			continue
 		}
 		echo, ok := msg.Body.(*icmp.Echo)
-		if !ok || echo.ID != IcmpID {
+		if !ok {
+			log.Printf("icmpRecvLoop: body not *icmp.Echo")
+			continue
+		}
+		log.Printf("icmpRecvLoop: echo id=%#x seq=%d data=%d bytes", echo.ID, echo.Seq, len(echo.Data))
+		if echo.ID != IcmpID {
+			log.Printf("icmpRecvLoop: id mismatch (want %#x)", IcmpID)
 			continue
 		}
 		data := echo.Data
 		if len(data) < 8 {
+			log.Printf("icmpRecvLoop: payload too short (%d bytes)", len(data))
 			continue
 		}
 		var pktID turbotunnel.ClientID
 		copy(pktID[:], data[:8])
 		if pktID != c.clientID {
+			log.Printf("icmpRecvLoop: clientID mismatch (got %x, want %x)", pktID, c.clientID)
 			continue
 		}
-		log.Printf("icmpRecvLoop: tunnel pkt id=%#x data=%d bytes", echo.ID, len(data))
+		log.Printf("icmpRecvLoop: tunnel packet accepted, unpacking KCP payloads")
 
 		// Unpack length-prefixed KCP packets from the ICMP payload.
 		r := bytes.NewReader(data[8:])
@@ -137,6 +151,7 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 				break
 			}
 			any = true
+			log.Printf("icmpRecvLoop: queued KCP packet %d bytes", length)
 			c.QueuePacketConn.QueueIncoming(p, turbotunnel.DummyAddr{})
 		}
 		if any {
