@@ -131,12 +131,18 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 		st.mu.Unlock()
 		// Feed upstream KCP packets from the DNS query payload.
 		r := bytes.NewReader(payload)
+		nPkts := 0
 		for {
 			p, err := serverNextPacket(r)
 			if err != nil {
 				break
 			}
+			nPkts++
+			log.Printf("handleQuery: clientID=%s queuing KCP packet %d bytes", clientID, len(p))
 			st.ttConn.QueueIncoming(p, clientID)
+		}
+		if nPkts == 0 {
+			log.Printf("handleQuery: clientID=%s poll (no KCP data)", clientID)
 		}
 	} else if resp.Rcode() == dns.RcodeNoError {
 		resp.Flags |= dns.RcodeNameError
@@ -220,7 +226,9 @@ func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP 
 			}
 		}
 
-		if err := st.sendICMP(payload.Bytes(), clientIP); err != nil {
+		pld := payload.Bytes()
+		log.Printf("icmpSendLoop: sending %d bytes to %v", len(pld), clientIP)
+		if err := st.sendICMP(pld, clientIP); err != nil {
 			log.Printf("ICMP send to %v: %v", clientIP, err)
 		}
 	}

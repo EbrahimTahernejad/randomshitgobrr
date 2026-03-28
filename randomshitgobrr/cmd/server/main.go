@@ -77,10 +77,13 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 }
 
 func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error {
+	log.Printf("session %08x: noise handshake starting", conn.GetConv())
 	rw, err := noise.NewServer(conn, privkey)
 	if err != nil {
+		log.Printf("session %08x: noise handshake error: %v", conn.GetConv(), err)
 		return err
 	}
+	log.Printf("session %08x: noise handshake done", conn.GetConv())
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	smuxConfig.KeepAliveTimeout = idleTimeout
