@@ -180,6 +180,8 @@ func main() {
 	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS query type: txt, cname, a, aaaa, mx, ns, srv (must match server)")
 	flag.BoolVar(&verbose, "verbose", false, "enable per-packet diagnostic logging")
 	flag.IntVar(&broadcast, "broadcast", 1, "resolvers to send each packet to (1 = round-robin, >1 = redundant sends)")
+	var udpPort int
+	flag.IntVar(&udpPort, "downstream-udp-port", 0, "listen on this UDP port for downstream from server instead of ICMP (must match server, 0=ICMP)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-udp ADDR [-udp ADDR ...]|-doh URL|-dot ADDR] -pubkey-file FILE DOMAIN LOCALADDR\n\n", os.Args[0])
 		flag.PrintDefaults()
@@ -271,6 +273,7 @@ func main() {
 		IcmpID:      icmpID,
 		MaxLabelLen: maxLabelLen,
 		RecordType:  recordType,
+		UDPPort:     udpPort,
 		Verbose:     verbose,
 	}
 	if err := run(pubkey, domain, localAddr, resolvers, broadcast, transport, cfg); err != nil {

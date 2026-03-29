@@ -29,17 +29,18 @@ const (
 )
 
 // ServerTransport manages the server side of the hybrid tunnel.
-// DNS queries carry upstream KCP packets; ICMP Echo Requests carry downstream.
+// DNS queries carry upstream KCP packets; downstream is ICMP or UDP depending on cfg.UDPPort.
 type ServerTransport struct {
 	cfg        Config
 	domain     dns.Name
-	destIP     net.IP // client's public IP — destination of downstream ICMP
+	destIP     net.IP // client's public IP — destination of downstream packets
 	spoofSrcIP net.IP
 	ttConn     *turbotunnel.QueuePacketConn
 
-	rawFd    int              // IPv4 raw socket for spoofed ICMP (IP_HDRINCL)
-	icmpConn *icmp.PacketConn // normal ICMP send (no spoofing)
-	icmpSeq  atomic.Uint32
+	rawFd       int              // IPv4 raw socket for spoofed ICMP or UDP (IP_HDRINCL)
+	icmpConn    *icmp.PacketConn // normal ICMP send (no spoofing)
+	udpSendConn *net.UDPConn    // normal UDP send (no spoofing, UDPPort mode only)
+	icmpSeq     atomic.Uint32
 
 	mu        sync.Mutex
 	clientIPs map[turbotunnel.ClientID]net.IP
@@ -62,34 +63,59 @@ func NewServerTransport(domain dns.Name, destIP net.IP, spoofSrcIP net.IP, ttCon
 		clientIPs:  make(map[turbotunnel.ClientID]net.IP),
 	}
 
-	if spoofSrcIP != nil && spoofSrcIP.To4() != nil {
-		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
-		if err != nil {
-			return nil, fmt.Errorf("raw socket (needs root/CAP_NET_RAW): %w", err)
+	if cfg.UDPPort > 0 {
+		// UDP downstream mode.
+		if spoofSrcIP != nil && spoofSrcIP.To4() != nil {
+			fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+			if err != nil {
+				return nil, fmt.Errorf("raw socket for spoofed UDP (needs root/CAP_NET_RAW): %w", err)
+			}
+			if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+				syscall.Close(fd)
+				return nil, fmt.Errorf("setsockopt IP_HDRINCL: %w", err)
+			}
+			st.rawFd = fd
+		} else {
+			conn, err := net.ListenUDP("udp", nil)
+			if err != nil {
+				return nil, fmt.Errorf("udp send socket: %w", err)
+			}
+			st.udpSendConn = conn
 		}
-		if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
-			syscall.Close(fd)
-			return nil, fmt.Errorf("setsockopt IP_HDRINCL: %w", err)
-		}
-		st.rawFd = fd
 	} else {
-		conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-		if err != nil {
-			return nil, fmt.Errorf("icmp listen (needs root/CAP_NET_RAW): %w", err)
+		// ICMP downstream mode (default).
+		if spoofSrcIP != nil && spoofSrcIP.To4() != nil {
+			fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+			if err != nil {
+				return nil, fmt.Errorf("raw socket for spoofed ICMP (needs root/CAP_NET_RAW): %w", err)
+			}
+			if err := syscall.SetsockoptInt(fd, syscall.IPPROTO_IP, syscall.IP_HDRINCL, 1); err != nil {
+				syscall.Close(fd)
+				return nil, fmt.Errorf("setsockopt IP_HDRINCL: %w", err)
+			}
+			st.rawFd = fd
+		} else {
+			conn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+			if err != nil {
+				return nil, fmt.Errorf("icmp listen (needs root/CAP_NET_RAW): %w", err)
+			}
+			st.icmpConn = conn
 		}
-		st.icmpConn = conn
 	}
 
 	return st, nil
 }
 
-// Close releases the raw socket or ICMP connection.
+// Close releases the raw socket or ICMP/UDP connection.
 func (st *ServerTransport) Close() {
 	if st.rawFd >= 0 {
 		syscall.Close(st.rawFd)
 	}
 	if st.icmpConn != nil {
 		st.icmpConn.Close()
+	}
+	if st.udpSendConn != nil {
+		st.udpSendConn.Close()
 	}
 }
 
@@ -139,11 +165,19 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 		if _, known := st.clientIPs[clientID]; !known {
 			st.clientIPs[clientID] = st.destIP
 			isNew = true
-			go st.icmpSendLoop(clientID, st.destIP)
+			if st.cfg.UDPPort > 0 {
+				go st.udpSendLoop(clientID, st.destIP)
+			} else {
+				go st.icmpSendLoop(clientID, st.destIP)
+			}
 		}
 		st.mu.Unlock()
 		if isNew {
-			log.Printf("handleQuery: new client %x from %v → ICMP dest %v", dnsClientID, addr, st.destIP)
+			proto := "ICMP"
+			if st.cfg.UDPPort > 0 {
+				proto = fmt.Sprintf("UDP:%d", st.cfg.UDPPort)
+			}
+			log.Printf("handleQuery: new client %x from %v → %s dest %v", dnsClientID, addr, proto, st.destIP)
 		}
 
 		// Feed upstream KCP packets from the DNS query payload.
@@ -194,11 +228,11 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 	dnsConn.WriteTo(respBuf, addr)
 }
 
-// icmpSendLoop runs per active client: drains the KCP outgoing queue and sends
-// the packets to the client's real IP as ICMP Echo Requests, bundling multiple
-// KCP packets per ICMP datagram where possible.
-func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP net.IP) {
-	log.Printf("client %s up, sending ICMP to %v", clientID, clientIP)
+// downstreamSendLoop is the shared send loop for both ICMP and UDP downstream.
+// It drains the KCP outgoing queue for clientID, bundles packets into datagrams,
+// and calls send for each bundle. proto is used only for log messages.
+func (st *ServerTransport) downstreamSendLoop(clientID turbotunnel.ClientID, clientIP net.IP, proto string, send func([]byte, net.IP) error) {
+	log.Printf("client %s up, sending %s to %v", clientID, proto, clientIP)
 	defer func() {
 		st.mu.Lock()
 		delete(st.clientIPs, clientID)
@@ -210,9 +244,8 @@ func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP 
 	idle := time.NewTimer(clientExpiry)
 	defer idle.Stop()
 
-	var overflow []byte // packet that didn't fit in the previous ICMP
+	var overflow []byte
 	for {
-		// Block for the first packet (or idle timeout).
 		var p []byte
 		if overflow != nil {
 			p = overflow
@@ -234,10 +267,8 @@ func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP 
 
 		// Bundle greedily up to icmpBundleMax bytes.
 		var payload bytes.Buffer
-		payload.Write(clientID.Bytes()) // client ID prefix
+		payload.Write(clientID.Bytes())
 		for p != nil {
-			// Only check limit after the first packet; let oversized packets
-			// through so they are at least attempted once.
 			if payload.Len() > st.cfg.ClientIDLen && payload.Len()+2+len(p) > icmpBundleMax {
 				overflow = p
 				break
@@ -251,24 +282,32 @@ func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP 
 			}
 		}
 
-		pktCount := 0
-		scanBuf := payload.Bytes()[st.cfg.ClientIDLen:]
-		sr := bytes.NewReader(scanBuf)
-		for {
-			var l uint16
-			if binary.Read(sr, binary.BigEndian, &l) != nil {
-				break
-			}
-			sr.Seek(int64(l), io.SeekCurrent)
-			pktCount++
-		}
 		if st.cfg.Verbose {
-			log.Printf("icmpSendLoop: → %v: %d KCP packet(s), %d bytes payload", clientIP, pktCount, payload.Len())
+			pktCount := 0
+			sr := bytes.NewReader(payload.Bytes()[st.cfg.ClientIDLen:])
+			for {
+				var l uint16
+				if binary.Read(sr, binary.BigEndian, &l) != nil {
+					break
+				}
+				sr.Seek(int64(l), io.SeekCurrent)
+				pktCount++
+			}
+			log.Printf("%sSendLoop: → %v: %d KCP packet(s), %d bytes payload", proto, clientIP, pktCount, payload.Len())
 		}
-		if err := st.sendICMP(payload.Bytes(), clientIP); err != nil {
-			log.Printf("ICMP send to %v: %v", clientIP, err)
+
+		if err := send(payload.Bytes(), clientIP); err != nil {
+			log.Printf("%s send to %v: %v", proto, clientIP, err)
 		}
 	}
+}
+
+func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP net.IP) {
+	st.downstreamSendLoop(clientID, clientIP, "ICMP", st.sendICMP)
+}
+
+func (st *ServerTransport) udpSendLoop(clientID turbotunnel.ClientID, clientIP net.IP) {
+	st.downstreamSendLoop(clientID, clientIP, "UDP", st.sendUDP)
 }
 
 func (st *ServerTransport) sendICMP(payload []byte, dstIP net.IP) error {
@@ -330,6 +369,56 @@ func (st *ServerTransport) sendICMPNormal(payload []byte, dstIP net.IP) error {
 		return err
 	}
 	_, err = st.icmpConn.WriteTo(b, &net.IPAddr{IP: dstIP})
+	return err
+}
+
+func (st *ServerTransport) sendUDP(payload []byte, dstIP net.IP) error {
+	if st.rawFd >= 0 {
+		return st.sendUDPSpoofed(payload, dstIP)
+	}
+	return st.sendUDPNormal(payload, dstIP)
+}
+
+// sendUDPSpoofed builds a full IP+UDP packet with a spoofed source address
+// and sends it via the raw socket.
+func (st *ServerTransport) sendUDPSpoofed(payload []byte, dstIP net.IP) error {
+	src4 := st.spoofSrcIP.To4()
+	dst4 := dstIP.To4()
+	if src4 == nil || dst4 == nil {
+		return fmt.Errorf("spoofed UDP requires IPv4")
+	}
+
+	ipLayer := &layers.IPv4{
+		Version:  4,
+		IHL:      5,
+		TTL:      64,
+		Protocol: layers.IPProtocolUDP,
+		SrcIP:    net.IP(src4),
+		DstIP:    net.IP(dst4),
+	}
+	udpLayer := &layers.UDP{
+		SrcPort: layers.UDPPort(st.cfg.UDPSrcPort),
+		DstPort: layers.UDPPort(st.cfg.UDPPort),
+	}
+	if err := udpLayer.SetNetworkLayerForChecksum(ipLayer); err != nil {
+		return fmt.Errorf("SetNetworkLayerForChecksum: %w", err)
+	}
+	buf := gopacket.NewSerializeBuffer()
+	if err := gopacket.SerializeLayers(buf,
+		gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true},
+		ipLayer, udpLayer, gopacket.Payload(payload),
+	); err != nil {
+		return fmt.Errorf("serialize UDP layers: %w", err)
+	}
+	var sa syscall.SockaddrInet4
+	copy(sa.Addr[:], dst4)
+	return syscall.Sendto(st.rawFd, buf.Bytes(), 0, &sa)
+}
+
+// sendUDPNormal sends a UDP datagram without spoofing the source IP.
+func (st *ServerTransport) sendUDPNormal(payload []byte, dstIP net.IP) error {
+	addr := &net.UDPAddr{IP: dstIP, Port: st.cfg.UDPPort}
+	_, err := st.udpSendConn.WriteTo(payload, addr)
 	return err
 }
 

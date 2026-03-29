@@ -71,12 +71,7 @@ func NewClientConn(transport net.PacketConn, resolvers []net.Addr, broadcast int
 	log.Printf("hybrid: clientID=%s icmpID=%#x maxLabelLen=%d recordType=%d mtu=%d resolvers=%d broadcast=%d",
 		clientID, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType, cfg.MaxKCPMTU(), len(resolvers), broadcast)
 
-	icmpConn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
-	if err != nil {
-		return nil, fmt.Errorf("listen ICMP (requires root/CAP_NET_RAW): %w", err)
-	}
-
-	// Drain DNS responses — downstream data arrives via ICMP instead.
+	// Drain DNS responses — downstream data arrives via ICMP or UDP instead.
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -86,12 +81,29 @@ func NewClientConn(transport net.PacketConn, resolvers []net.Addr, broadcast int
 		}
 	}()
 
-	go func() {
-		defer icmpConn.Close()
-		if err := c.icmpRecvLoop(icmpConn); err != nil {
-			log.Printf("icmpRecvLoop: %v", err)
+	if cfg.UDPPort > 0 {
+		udpConn, err := net.ListenUDP("udp", &net.UDPAddr{Port: cfg.UDPPort})
+		if err != nil {
+			return nil, fmt.Errorf("listen UDP port %d: %w", cfg.UDPPort, err)
 		}
-	}()
+		go func() {
+			defer udpConn.Close()
+			if err := c.udpRecvLoop(udpConn); err != nil {
+				log.Printf("udpRecvLoop: %v", err)
+			}
+		}()
+	} else {
+		icmpConn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
+		if err != nil {
+			return nil, fmt.Errorf("listen ICMP (requires root/CAP_NET_RAW): %w", err)
+		}
+		go func() {
+			defer icmpConn.Close()
+			if err := c.icmpRecvLoop(icmpConn); err != nil {
+				log.Printf("icmpRecvLoop: %v", err)
+			}
+		}()
+	}
 
 	go func() {
 		if err := c.dnsSendLoop(transport); err != nil {
@@ -166,6 +178,58 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 		if count > 0 {
 			if c.cfg.Verbose {
 				log.Printf("icmpRecvLoop: accepted from %v: %d KCP packet(s), %d bytes total", src, count, totalBytes)
+			}
+			select {
+			case c.pollChan <- struct{}{}:
+			default:
+			}
+		}
+	}
+}
+
+// udpRecvLoop listens on a UDP port for downstream packets from the server,
+// filters by client ID prefix, unpacks bundled KCP packets, and queues them.
+// The payload format is identical to ICMP: [clientID:N][uint16-len][data]...
+// No raw socket needed — the OS strips IP/UDP headers before delivery.
+func (c *ClientConn) udpRecvLoop(conn *net.UDPConn) error {
+	log.Printf("udpRecvLoop: started (port=%d clientID=%s)", c.cfg.UDPPort, c.clientID)
+	buf := make([]byte, 65536)
+	idBytes := c.clientID.Bytes()
+	for {
+		n, src, err := conn.ReadFromUDP(buf)
+		if err != nil {
+			return err
+		}
+		data := buf[:n]
+		if len(data) < len(idBytes) {
+			continue
+		}
+		if !bytes.Equal(data[:len(idBytes)], idBytes) {
+			if c.cfg.Verbose {
+				log.Printf("udpRecvLoop: clientID mismatch from %v (got %x, want %s)", src, data[:len(idBytes)], c.clientID)
+			}
+			continue
+		}
+		r := bytes.NewReader(data[len(idBytes):])
+		count := 0
+		totalBytes := 0
+		for {
+			var length uint16
+			if err := binary.Read(r, binary.BigEndian, &length); err != nil {
+				break
+			}
+			p := make([]byte, length)
+			if _, err := io.ReadFull(r, p); err != nil {
+				log.Printf("udpRecvLoop: truncated KCP packet from %v (expected %d bytes)", src, length)
+				break
+			}
+			count++
+			totalBytes += len(p)
+			c.QueuePacketConn.QueueIncoming(p, turbotunnel.DummyAddr{})
+		}
+		if count > 0 {
+			if c.cfg.Verbose {
+				log.Printf("udpRecvLoop: accepted from %v: %d KCP packet(s), %d bytes total", src, count, totalBytes)
 			}
 			select {
 			case c.pollChan <- struct{}{}:

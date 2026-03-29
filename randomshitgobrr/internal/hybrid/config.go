@@ -63,7 +63,18 @@ type Config struct {
 	// Default: RRTypeTXT (16).
 	RecordType uint16
 
-	// Verbose enables per-packet diagnostic logging (DNS sends, ICMP
+	// UDPPort, when non-zero, switches the downstream transport from ICMP to
+	// raw spoofed UDP. The client listens on this port; the server sends to it.
+	// Must be identical on client and server. 0 = ICMP (default).
+	UDPPort int
+
+	// UDPSrcPort is the source port stamped on the server's spoofed UDP
+	// packets. Only used when UDPPort > 0. Using a common port (e.g. 53, 443)
+	// can help with stateful firewalls that track UDP flows.
+	// Default: 53. Only meaningful on the server side.
+	UDPSrcPort int
+
+	// Verbose enables per-packet diagnostic logging (DNS sends, ICMP/UDP
 	// receives, KCP bundle stats). Disabled by default; enable with -verbose.
 	Verbose bool
 }
@@ -75,6 +86,7 @@ func DefaultConfig() Config {
 		IcmpID:      0x5350,
 		MaxLabelLen: 63,
 		RecordType:  RRTypeTXT,
+		UDPSrcPort:  53,
 	}
 }
 

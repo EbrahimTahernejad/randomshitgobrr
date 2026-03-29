@@ -231,8 +231,11 @@ func main() {
 	flag.StringVar(&pubFile, "pubkey-file", "", "server public key file (with -gen-key)")
 	flag.StringVar(&privkeyHex, "privkey", "", "server private key (hex)")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen for DNS queries (required)")
-	flag.StringVar(&destIPStr, "dest-ip", "", "client's public IPv4 address to send downstream ICMP to (required)")
-	flag.StringVar(&spoofSrcStr, "spoof-src", "", "spoofed source IP for downstream ICMP (leave empty for normal ICMP)")
+	flag.StringVar(&destIPStr, "dest-ip", "", "client's public IPv4 address to send downstream traffic to (required)")
+	flag.StringVar(&spoofSrcStr, "spoof-src", "", "spoofed source IP for downstream ICMP/UDP (leave empty for normal send)")
+	var udpPort, udpSrcPort int
+	flag.IntVar(&udpPort, "downstream-udp-port", 0, "use UDP downstream instead of ICMP; client listens on this port (must match client, 0=ICMP)")
+	flag.IntVar(&udpSrcPort, "downstream-udp-src-port", defCfg.UDPSrcPort, "source port for spoofed downstream UDP packets (e.g. 53 looks like DNS response)")
 	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "bytes used as DNS/ICMP session ID (must match client)")
 	flag.IntVar(&icmpID, "icmp-id", defCfg.IcmpID, "ICMP Echo identifier for tunnel packets (must match client)")
 	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match client)")
@@ -322,6 +325,8 @@ func main() {
 		IcmpID:      icmpID,
 		MaxLabelLen: maxLabelLen,
 		RecordType:  recordType,
+		UDPPort:     udpPort,
+		UDPSrcPort:  udpSrcPort,
 		Verbose:     verbose,
 	}
 	if err := run(privkey, domain, destIP, spoofSrcIP, upstream, dnsConn, cfg); err != nil {
