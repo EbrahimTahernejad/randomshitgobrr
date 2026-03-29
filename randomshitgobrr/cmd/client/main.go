@@ -75,7 +75,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	defer transport.Close()
 
 	mtu := cfg.MaxKCPMTU()
-	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen)
+	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d recordType=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType)
 
 	pconn, err := hybrid.NewClientConn(transport, remoteAddr, domain, cfg)
 	if err != nil {
@@ -158,6 +158,8 @@ func main() {
 	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "bytes used as DNS/ICMP session ID (must match server)")
 	flag.IntVar(&icmpID, "icmp-id", defCfg.IcmpID, "ICMP Echo identifier for tunnel packets (must match server)")
 	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match server)")
+	var recordTypeStr string
+	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS query type: txt, cname, a, aaaa, mx, ns, srv (must match server)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-udp ADDR|-doh URL|-dot ADDR] -pubkey-file FILE DOMAIN LOCALADDR\n\n", os.Args[0])
 		flag.PrintDefaults()
@@ -236,10 +238,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	recordType, err := hybrid.ParseRecordType(recordTypeStr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	cfg := hybrid.Config{
 		ClientIDLen: clientIDLen,
 		IcmpID:      icmpID,
 		MaxLabelLen: maxLabelLen,
+		RecordType:  recordType,
 	}
 	if err := run(pubkey, domain, localAddr, remoteAddr, transport, cfg); err != nil {
 		log.Fatal(err)

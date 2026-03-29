@@ -251,7 +251,7 @@ func (c *ClientConn) sendDNS(transport net.PacketConn, p []byte, addr net.Addr) 
 		ID:    id,
 		Flags: 0x0100,
 		Question: []dns.Question{
-			{Name: name, Type: dns.RRTypeTXT, Class: dns.ClassIN},
+			{Name: name, Type: c.cfg.RecordType, Class: dns.ClassIN},
 		},
 		Additional: []dns.RR{
 			{Name: dns.Name{}, Type: dns.RRTypeOPT, Class: 4096, TTL: 0, Data: []byte{}},

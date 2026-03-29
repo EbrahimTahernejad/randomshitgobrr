@@ -75,6 +75,7 @@ Copy `server.pub` to the client machine.
 | `-client-id-len` | no | Bytes used as DNS/ICMP session ID. Default: `2`. **Must match client.** |
 | `-icmp-id` | no | ICMP Echo identifier for tunnel packets. Default: `0x5350`. **Must match client.** |
 | `-max-label-len` | no | Max base32 chars per DNS label. Default: `63`. **Must match client.** |
+| `-record-type` | no | DNS query type to accept: `txt`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`. Default: `txt`. **Must match client.** |
 | `DOMAIN` | yes | Tunnel domain (must match NS delegation) |
 | `UPSTREAM` | yes | TCP address to forward tunneled connections to |
 
@@ -112,6 +113,7 @@ sysctl -p
 | `-client-id-len` | no | Bytes used as DNS/ICMP session ID. Default: `2`. **Must match server.** |
 | `-icmp-id` | no | ICMP Echo identifier for tunnel packets. Default: `0x5350`. **Must match server.** |
 | `-max-label-len` | no | Max base32 chars per DNS label. Default: `63`. **Must match server.** |
+| `-record-type` | no | DNS query type: `txt`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`. Default: `txt`. **Must match server.** |
 | `DOMAIN` | yes | Tunnel domain (must match server) |
 | `LOCALADDR` | yes | Local TCP address to listen on — connect your app here |
 
@@ -126,6 +128,7 @@ The three `-client-id-len`, `-icmp-id`, and `-max-label-len` flags must be **ide
 | `-client-id-len` | Server reads wrong prefix length from DNS; ICMP filter fails on client |
 | `-icmp-id` | Client ignores all downstream ICMP (ID mismatch) |
 | `-max-label-len` | Client truncates queries at a different boundary than server decodes |
+| `-record-type` | Server returns NXDOMAIN for every query; tunnel never establishes |
 
 The KCP MTU is derived automatically: `floor(max-label-len × 5/8) − client-id-len − 1`. With defaults this is **36 bytes** per segment, which base32-encodes to exactly 63 characters — one DNS label.
 

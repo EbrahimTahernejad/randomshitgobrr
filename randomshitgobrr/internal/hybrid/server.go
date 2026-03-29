@@ -116,7 +116,7 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 		return
 	}
 
-	resp, payload := responseFor(&query, st.domain)
+	resp, payload := responseFor(&query, st.domain, st.cfg.RecordType)
 	if resp == nil {
 		return
 	}
@@ -301,7 +301,7 @@ func (st *ServerTransport) sendICMPNormal(payload []byte, dstIP net.IP) error {
 // Returns (nil, nil) if the query should not be answered at all.
 // Returns (resp, payload) where payload is the base32-decoded label prefix data.
 // Copied verbatim from dnstt-server for wire-format compatibility.
-func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
+func responseFor(query *dns.Message, domain dns.Name, recordType uint16) (*dns.Message, []byte) {
 	resp := &dns.Message{
 		ID:       query.ID,
 		Flags:    0x8000,
@@ -352,7 +352,7 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 		resp.Flags |= dns.RcodeNotImplemented
 		return resp, nil
 	}
-	if question.Type != dns.RRTypeTXT {
+	if question.Type != recordType {
 		resp.Flags |= dns.RcodeNameError
 		return resp, nil
 	}

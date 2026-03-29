@@ -143,7 +143,7 @@ func run(privkey []byte, domain dns.Name, destIP net.IP, spoofSrcIP net.IP, upst
 	defer dnsConn.Close()
 
 	mtu := cfg.MaxKCPMTU()
-	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen)
+	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d recordType=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType)
 	log.Printf("server pubkey %x", noise.PubkeyFromPrivkey(privkey))
 
 	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
@@ -232,6 +232,8 @@ func main() {
 	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "bytes used as DNS/ICMP session ID (must match client)")
 	flag.IntVar(&icmpID, "icmp-id", defCfg.IcmpID, "ICMP Echo identifier for tunnel packets (must match client)")
 	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match client)")
+	var recordTypeStr string
+	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS query type to accept: txt, cname, a, aaaa, mx, ns, srv (must match client)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n  %s -gen-key [-privkey-file FILE] [-pubkey-file FILE]\n  %s -udp ADDR -dest-ip IP [-privkey-file FILE] [-spoof-src IP] DOMAIN UPSTREAMADDR\n\n", os.Args[0], os.Args[0])
 		flag.PrintDefaults()
@@ -305,10 +307,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	recordType, err := hybrid.ParseRecordType(recordTypeStr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	cfg := hybrid.Config{
 		ClientIDLen: clientIDLen,
 		IcmpID:      icmpID,
 		MaxLabelLen: maxLabelLen,
+		RecordType:  recordType,
 	}
 	if err := run(privkey, domain, destIP, spoofSrcIP, upstream, dnsConn, cfg); err != nil {
 		log.Fatal(err)
