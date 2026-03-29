@@ -17,8 +17,8 @@ import (
 	"github.com/google/gopacket/layers"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-	"www.bamsoftware.com/git/dnstt.git/dns"
-	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+	"github.com/net2share/vaydns/dns"
+	"github.com/net2share/vaydns/turbotunnel"
 )
 
 const (
@@ -129,9 +129,8 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 			resp.Flags |= dns.RcodeNameError
 		}
 	} else {
-		// Extract the client ID and zero-pad to turbotunnel.ClientID ([8]byte).
-		var clientID turbotunnel.ClientID
-		copy(clientID[:], payload[:st.cfg.ClientIDLen])
+		// Extract the client ID from the DNS payload.
+		clientID := turbotunnel.ClientID(payload[:st.cfg.ClientIDLen])
 		dnsClientID := payload[:st.cfg.ClientIDLen]
 		payload = payload[st.cfg.ClientIDLen:]
 
@@ -231,7 +230,7 @@ func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP 
 
 		// Bundle greedily up to icmpBundleMax bytes.
 		var payload bytes.Buffer
-		payload.Write(clientID[:st.cfg.ClientIDLen]) // client ID prefix
+		payload.Write(clientID.Bytes()) // client ID prefix
 		for p != nil {
 			// Only check limit after the first packet; let oversized packets
 			// through so they are at least attempted once.
@@ -331,7 +330,7 @@ func (st *ServerTransport) sendICMPNormal(payload []byte, dstIP net.IP) error {
 // responseFor constructs a DNS response for a query addressed to domain.
 // Returns (nil, nil) if the query should not be answered at all.
 // Returns (resp, payload) where payload is the base32-decoded label prefix data.
-// Copied verbatim from dnstt-server for wire-format compatibility.
+// Adapted from vaydns-server for wire-format compatibility.
 func responseFor(query *dns.Message, domain dns.Name, recordType uint16) (*dns.Message, []byte) {
 	resp := &dns.Message{
 		ID:       query.ID,

@@ -13,9 +13,7 @@ Stack: KCP → Noise NK (encryption) → SMUX (multiplexing) → TCP
 
 This project is built on top of existing tools:
 
-- **[dnstt](https://www.bamsoftware.com/git/dnstt.git)** by David Fifield — DNS tunnel using KCP, Noise, and SMUX. The overall protocol structure, Noise NK layer, and SMUX integration come directly from dnstt. Licensed under the MIT License.
-
-- **[VayDNS](https://github.com/net2share/vaydns)** by net2share — compact DNS tunnel wire format. The `[clientID:N][datalen:1][data]` encoding and single-label query design are adapted from VayDNS. Licensed under the MIT License.
+- **[VayDNS](https://github.com/net2share/vaydns)** by net2share — DNS tunnel using KCP, Noise NK, SMUX, and the `[clientID:N][datalen:1][data]` single-label wire format. The protocol structure, Noise layer, SMUX integration, DNS and turbotunnel packages all come from VayDNS. Licensed under the MIT License.
 
 - **[spoof-tunnel](https://github.com/ParsaKSH/spoof-tunnel)** by ParsaKSH — ICMP tunnel with IP source spoofing via raw sockets. The raw socket send approach and gopacket-based packet construction are adapted from spoof-tunnel. Licensed under the MIT License.
 
@@ -200,4 +198,4 @@ App → TCP
 
 MIT — see [LICENSE](LICENSE).
 
-Third-party components retain their original licenses (see `../dnstt`, `../vaydns`, and `../spoof-tunnel`).
+Third-party components retain their original licenses (see `../vaydns` and `../spoof-tunnel`).

@@ -16,8 +16,8 @@ import (
 
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
-	"www.bamsoftware.com/git/dnstt.git/dns"
-	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+	"github.com/net2share/vaydns/dns"
+	"github.com/net2share/vaydns/turbotunnel"
 )
 
 const (
@@ -49,7 +49,7 @@ type ClientConn struct {
 // cfg controls wire-protocol parameters; use DefaultConfig() for normal operation.
 // Requires root or CAP_NET_RAW for raw ICMP reception.
 func NewClientConn(transport net.PacketConn, addr net.Addr, domain dns.Name, cfg Config) (*ClientConn, error) {
-	clientID := turbotunnel.NewClientID()
+	clientID := turbotunnel.NewClientID(8)
 	dnsClientID := make([]byte, cfg.ClientIDLen)
 	if _, err := rand.Read(dnsClientID); err != nil {
 		return nil, fmt.Errorf("generate DNS client ID: %w", err)

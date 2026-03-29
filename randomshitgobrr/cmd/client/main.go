@@ -32,9 +32,9 @@ import (
 	"github.com/user/randomshitgobrr/internal/hybrid"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
-	"www.bamsoftware.com/git/dnstt.git/dns"
-	"www.bamsoftware.com/git/dnstt.git/noise"
-	"www.bamsoftware.com/git/dnstt.git/turbotunnel"
+	"github.com/net2share/vaydns/dns"
+	"github.com/net2share/vaydns/noise"
+	"github.com/net2share/vaydns/turbotunnel"
 )
 
 const idleTimeout = 2 * time.Minute

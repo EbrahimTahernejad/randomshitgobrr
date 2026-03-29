@@ -4,10 +4,10 @@ go 1.24.0
 
 require (
 	github.com/google/gopacket v1.1.19
+	github.com/net2share/vaydns v0.0.0-00010101000000-000000000000
 	github.com/xtaci/kcp-go/v5 v5.6.8
 	github.com/xtaci/smux v1.5.24
 	golang.org/x/net v0.47.0
-	www.bamsoftware.com/git/dnstt.git v0.0.0-00010101000000-000000000000
 )
 
 require (
@@ -21,6 +21,6 @@ require (
 	golang.org/x/time v0.14.0 // indirect
 )
 
-replace www.bamsoftware.com/git/dnstt.git => ../dnstt
+replace github.com/net2share/vaydns => ../vaydns
 
 replace github.com/xtaci/kcp-go/v5 => github.com/net2share/kcp-go/v5 v5.0.0-20260325165956-416ba9d3856d
