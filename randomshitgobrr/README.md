@@ -190,7 +190,7 @@ The client accepts TCP connections on `LOCALADDR` and forwards them through the 
 `hybrid-scanner` finds working DNS resolvers for the tunnel by probing IPs from a list. It runs as a three-stage pipeline:
 
 1. **Sampler** — reads IPs/CIDRs, reservoir-samples N, feeds into the DNS stage
-2. **DNS workers** — concurrently send NS and A queries to each IP; those that answer both are forwarded to the handshake stage
+2. **DNS workers** — concurrently send an A query to each IP; those that respond with NOERROR are forwarded to the handshake stage
 3. **Handshake workers** — run a full Noise handshake through each qualifying IP as a DNS relay and record the latency
 
 Stages 2 and 3 run simultaneously — while handshake workers are blocked waiting for KCP round-trips, DNS workers keep qualifying new IPs in the background.
@@ -199,13 +199,13 @@ Stages 2 and 3 run simultaneously — while handshake workers are blocked waitin
 hybrid-scanner \
   -list ranges.txt \
   -sample 500 \
-  -ns example.com \
   -a example.com \
   -domain t.example.com \
   -pubkey-file server.pub \
   -dns-workers 200 \
   -hs-workers 50 \
-  -timeout 8s \
+  -dns-timeout 3s \
+  -hs-timeout 10s \
   -output results.csv
 ```
 
@@ -221,13 +221,13 @@ hybrid-scanner \
 |------|---------|-------------|
 | `-list` | — | IP/CIDR list file (required) |
 | `-sample` | `100` | IPs to randomly sample |
-| `-ns` | — | Domain for NS query check (required) |
 | `-a` | — | Domain for A query check (required) |
 | `-domain` | — | Tunnel domain for handshake (required) |
 | `-pubkey-file` / `-pubkey` | — | Server public key |
-| `-dns-workers` | `200` | Concurrent NS+A check workers (stage 2) |
+| `-dns-workers` | `200` | Concurrent A-query workers (stage 2) |
 | `-hs-workers` | `50` | Concurrent Noise handshake workers (stage 3) |
-| `-timeout` | `10s` | Per-IP timeout (DNS checks and handshake) |
+| `-dns-timeout` | `3s` | Timeout for A query check |
+| `-hs-timeout` | `10s` | Timeout for Noise handshake |
 | `-dns-port` | `53` | DNS port on scanned IPs |
 | `-output` | `results.csv` | Output file |
 Output format: `ip,latency_ms`
