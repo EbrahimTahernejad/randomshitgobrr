@@ -81,7 +81,6 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 	if err != nil {
 		return fmt.Errorf("hybrid conn: %v", err)
 	}
-	log.Printf("client ID %s", pconn.ClientID())
 
 	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
 	if err != nil {

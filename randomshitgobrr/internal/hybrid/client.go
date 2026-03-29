@@ -35,11 +35,10 @@ var base32Enc = base32.StdEncoding.WithPadding(base32.NoPadding)
 // reads come from raw ICMP Echo Requests sent by the server.
 type ClientConn struct {
 	*turbotunnel.QueuePacketConn
-	cfg         Config
-	clientID    turbotunnel.ClientID // 8-byte internal KCP session identifier
-	dnsClientID []byte               // cfg.ClientIDLen bytes; sent in DNS queries and ICMP payloads
-	domain      dns.Name
-	pollChan    chan struct{}
+	cfg      Config
+	clientID turbotunnel.ClientID // cfg.ClientIDLen bytes; used on wire and as turbotunnel identity
+	domain   dns.Name
+	pollChan chan struct{}
 }
 
 // NewClientConn creates a ClientConn and starts its background goroutines.
@@ -49,21 +48,16 @@ type ClientConn struct {
 // cfg controls wire-protocol parameters; use DefaultConfig() for normal operation.
 // Requires root or CAP_NET_RAW for raw ICMP reception.
 func NewClientConn(transport net.PacketConn, addr net.Addr, domain dns.Name, cfg Config) (*ClientConn, error) {
-	clientID := turbotunnel.NewClientID(8)
-	dnsClientID := make([]byte, cfg.ClientIDLen)
-	if _, err := rand.Read(dnsClientID); err != nil {
-		return nil, fmt.Errorf("generate DNS client ID: %w", err)
-	}
+	clientID := turbotunnel.NewClientID(cfg.ClientIDLen)
 	c := &ClientConn{
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
 		cfg:             cfg,
 		clientID:        clientID,
-		dnsClientID:     dnsClientID,
 		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
 	}
-	log.Printf("hybrid: dnsClientID=%x icmpID=%#x maxLabelLen=%d recordType=%d mtu=%d",
-		dnsClientID, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType, cfg.MaxKCPMTU())
+	log.Printf("hybrid: clientID=%s icmpID=%#x maxLabelLen=%d recordType=%d mtu=%d",
+		clientID, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType, cfg.MaxKCPMTU())
 
 	icmpConn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
@@ -96,14 +90,14 @@ func NewClientConn(transport net.PacketConn, addr net.Addr, domain dns.Name, cfg
 	return c, nil
 }
 
-// ClientID returns the internal KCP session identifier.
+// ClientID returns the client identifier (used on wire and as turbotunnel identity).
 func (c *ClientConn) ClientID() turbotunnel.ClientID { return c.clientID }
 
 // icmpRecvLoop listens for ICMP Echo Requests, filters by IcmpID and the
-// DNS client ID prefix in the payload, then unpacks bundled KCP packets
+// client ID prefix in the payload, then unpacks bundled KCP packets
 // and queues them for KCP to read.
 func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
-	log.Printf("icmpRecvLoop: started (filtering icmpID=%#x dnsClientID=%x)", c.cfg.IcmpID, c.dnsClientID)
+	log.Printf("icmpRecvLoop: started (filtering icmpID=%#x clientID=%s)", c.cfg.IcmpID, c.clientID)
 	buf := make([]byte, 65536)
 	for {
 		n, _, src, err := conn.IPv4PacketConn().ReadFrom(buf)
@@ -127,17 +121,18 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 			continue
 		}
 		data := echo.Data
-		if len(data) < c.cfg.ClientIDLen {
-			log.Printf("icmpRecvLoop: packet from %v too short (%d bytes, need at least %d for clientID)", src, len(data), c.cfg.ClientIDLen)
+		idBytes := c.clientID.Bytes()
+		if len(data) < len(idBytes) {
+			log.Printf("icmpRecvLoop: packet from %v too short (%d bytes, need at least %d for clientID)", src, len(data), len(idBytes))
 			continue
 		}
-		if !bytes.Equal(data[:c.cfg.ClientIDLen], c.dnsClientID) {
-			log.Printf("icmpRecvLoop: clientID mismatch from %v (got %x, want %x)", src, data[:c.cfg.ClientIDLen], c.dnsClientID)
+		if !bytes.Equal(data[:len(idBytes)], idBytes) {
+			log.Printf("icmpRecvLoop: clientID mismatch from %v (got %x, want %s)", src, data[:len(idBytes)], c.clientID)
 			continue
 		}
 
 		// Unpack length-prefixed KCP packets from the ICMP payload.
-		r := bytes.NewReader(data[c.cfg.ClientIDLen:])
+		r := bytes.NewReader(data[len(idBytes):])
 		count := 0
 		totalBytes := 0
 		for {
@@ -226,14 +221,14 @@ func (c *ClientConn) dnsSendLoop(transport net.PacketConn, addr net.Addr) error 
 // prefixes.
 func (c *ClientConn) sendDNS(transport net.PacketConn, p []byte, addr net.Addr) error {
 	var raw bytes.Buffer
-	raw.Write(c.dnsClientID[:])
+	raw.Write(c.clientID.Bytes())
 	if len(p) > 0 {
 		if len(p) > 255 {
 			return fmt.Errorf("packet too long: %d bytes", len(p))
 		}
 		raw.WriteByte(byte(len(p)))
 		raw.Write(p)
-		log.Printf("dns: → data %d bytes (raw=%d encoded≤%d)", len(p), raw.Len()+1, c.cfg.MaxLabelLen)
+		log.Printf("dns: → data %d bytes (raw=%d encoded≤%d)", len(p), raw.Len(), c.cfg.MaxLabelLen)
 	} else {
 		io.CopyN(&raw, rand.Reader, pollNonceLen)
 		log.Printf("dns: → poll (raw=%d encoded≤%d)", raw.Len(), c.cfg.MaxLabelLen)
