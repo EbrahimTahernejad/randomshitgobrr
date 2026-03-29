@@ -86,7 +86,7 @@ func DefaultConfig() Config {
 		IcmpID:      0x5350,
 		MaxLabelLen: 63,
 		RecordType:  RRTypeTXT,
-		UDPSrcPort:  53,
+		UDPSrcPort:  0, // random
 	}
 }
 

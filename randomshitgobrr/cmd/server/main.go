@@ -237,7 +237,7 @@ func main() {
 	var udpPort int
 	var udpSrcPortStr string
 	flag.IntVar(&udpPort, "downstream-udp-port", 0, "use UDP downstream instead of ICMP; client listens on this port (must match client, 0=ICMP)")
-	flag.StringVar(&udpSrcPortStr, "downstream-udp-src-port", fmt.Sprint(defCfg.UDPSrcPort), "source port for spoofed downstream UDP (number or \"random\")")
+	flag.StringVar(&udpSrcPortStr, "downstream-udp-src-port", "random", "source port for spoofed downstream UDP (number or \"random\")")
 	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "bytes used as DNS/ICMP session ID (must match client)")
 	flag.IntVar(&icmpID, "icmp-id", defCfg.IcmpID, "ICMP Echo identifier for tunnel packets (must match client)")
 	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match client)")
