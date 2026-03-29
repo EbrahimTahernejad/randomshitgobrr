@@ -113,6 +113,7 @@ func (st *ServerTransport) RecvLoop(dnsConn net.PacketConn) error {
 func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.PacketConn) {
 	query, err := dns.MessageFromWireFormat(buf)
 	if err != nil {
+		log.Printf("handleQuery: parse error from %v: %v", addr, err)
 		return
 	}
 
@@ -123,6 +124,7 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 
 	// VayDNS wire format: [clientID:N][datalen:1][data]... or [clientID:N][nonce:4] for polls.
 	if len(payload) < st.cfg.ClientIDLen {
+		log.Printf("handleQuery: payload too short from %v (%d bytes, need at least %d for clientID)", addr, len(payload), st.cfg.ClientIDLen)
 		if resp.Rcode() == dns.RcodeNoError {
 			resp.Flags |= dns.RcodeNameError
 		}
@@ -130,24 +132,41 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 		// Extract the client ID and zero-pad to turbotunnel.ClientID ([8]byte).
 		var clientID turbotunnel.ClientID
 		copy(clientID[:], payload[:st.cfg.ClientIDLen])
+		dnsClientID := payload[:st.cfg.ClientIDLen]
 		payload = payload[st.cfg.ClientIDLen:]
 
 		st.mu.Lock()
+		isNew := false
 		if _, known := st.clientIPs[clientID]; !known {
 			st.clientIPs[clientID] = st.destIP
+			isNew = true
 			go st.icmpSendLoop(clientID, st.destIP)
 		}
 		st.mu.Unlock()
+		if isNew {
+			log.Printf("handleQuery: new client %x from %v → ICMP dest %v", dnsClientID, addr, st.destIP)
+		}
+
 		// Feed upstream KCP packets from the DNS query payload.
-		r := bytes.NewReader(payload)
-		for {
-			p, err := vaydnsNextPacket(r)
-			if err != nil {
-				break
+		if len(payload) <= pollNonceLen+1 {
+			// Poll query: payload is just a nonce, no data.
+			log.Printf("handleQuery: poll from %x @ %v (payload=%d bytes)", dnsClientID, addr, len(payload))
+		} else {
+			r := bytes.NewReader(payload)
+			count := 0
+			totalBytes := 0
+			for {
+				p, err := vaydnsNextPacket(r)
+				if err != nil {
+					break
+				}
+				if len(p) > 0 {
+					st.ttConn.QueueIncoming(p, clientID)
+					count++
+					totalBytes += len(p)
+				}
 			}
-			if len(p) > 0 {
-				st.ttConn.QueueIncoming(p, clientID)
-			}
+			log.Printf("handleQuery: data from %x @ %v: %d KCP packet(s), %d bytes queued", dnsClientID, addr, count, totalBytes)
 		}
 	}
 
@@ -229,6 +248,18 @@ func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP 
 			}
 		}
 
+		pktCount := 0
+		scanBuf := payload.Bytes()[st.cfg.ClientIDLen:]
+		sr := bytes.NewReader(scanBuf)
+		for {
+			var l uint16
+			if binary.Read(sr, binary.BigEndian, &l) != nil {
+				break
+			}
+			sr.Seek(int64(l), io.SeekCurrent)
+			pktCount++
+		}
+		log.Printf("icmpSendLoop: → %v: %d KCP packet(s), %d bytes payload", clientIP, pktCount, payload.Len())
 		if err := st.sendICMP(payload.Bytes(), clientIP); err != nil {
 			log.Printf("ICMP send to %v: %v", clientIP, err)
 		}

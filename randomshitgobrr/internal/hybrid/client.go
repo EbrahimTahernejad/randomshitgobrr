@@ -62,6 +62,8 @@ func NewClientConn(transport net.PacketConn, addr net.Addr, domain dns.Name, cfg
 		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
 	}
+	log.Printf("hybrid: dnsClientID=%x icmpID=%#x maxLabelLen=%d recordType=%d mtu=%d",
+		dnsClientID, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType, cfg.MaxKCPMTU())
 
 	icmpConn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
@@ -98,18 +100,20 @@ func NewClientConn(transport net.PacketConn, addr net.Addr, domain dns.Name, cfg
 func (c *ClientConn) ClientID() turbotunnel.ClientID { return c.clientID }
 
 // icmpRecvLoop listens for ICMP Echo Requests, filters by IcmpID and the
-// 2-byte DNS client ID prefix in the payload, then unpacks bundled KCP packets
+// DNS client ID prefix in the payload, then unpacks bundled KCP packets
 // and queues them for KCP to read.
 func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
+	log.Printf("icmpRecvLoop: started (filtering icmpID=%#x dnsClientID=%x)", c.cfg.IcmpID, c.dnsClientID)
 	buf := make([]byte, 65536)
 	for {
-		n, _, _, err := conn.IPv4PacketConn().ReadFrom(buf)
+		n, _, src, err := conn.IPv4PacketConn().ReadFrom(buf)
 		if err != nil {
 			return err
 		}
 
 		msg, err := icmp.ParseMessage(1, buf[:n])
 		if err != nil {
+			log.Printf("icmpRecvLoop: parse error from %v: %v", src, err)
 			continue
 		}
 		if msg.Type != ipv4.ICMPTypeEcho {
@@ -124,16 +128,18 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 		}
 		data := echo.Data
 		if len(data) < c.cfg.ClientIDLen {
+			log.Printf("icmpRecvLoop: packet from %v too short (%d bytes, need at least %d for clientID)", src, len(data), c.cfg.ClientIDLen)
 			continue
 		}
-		// Filter by DNS client ID prefix.
 		if !bytes.Equal(data[:c.cfg.ClientIDLen], c.dnsClientID) {
+			log.Printf("icmpRecvLoop: clientID mismatch from %v (got %x, want %x)", src, data[:c.cfg.ClientIDLen], c.dnsClientID)
 			continue
 		}
 
 		// Unpack length-prefixed KCP packets from the ICMP payload.
 		r := bytes.NewReader(data[c.cfg.ClientIDLen:])
-		any := false
+		count := 0
+		totalBytes := 0
 		for {
 			var length uint16
 			if err := binary.Read(r, binary.BigEndian, &length); err != nil {
@@ -141,12 +147,15 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 			}
 			p := make([]byte, length)
 			if _, err := io.ReadFull(r, p); err != nil {
+				log.Printf("icmpRecvLoop: truncated KCP packet from %v (expected %d bytes)", src, length)
 				break
 			}
-			any = true
+			count++
+			totalBytes += len(p)
 			c.QueuePacketConn.QueueIncoming(p, turbotunnel.DummyAddr{})
 		}
-		if any {
+		if count > 0 {
+			log.Printf("icmpRecvLoop: accepted from %v: %d KCP packet(s), %d bytes total", src, count, totalBytes)
 			select {
 			case c.pollChan <- struct{}{}:
 			default:
@@ -209,11 +218,12 @@ func (c *ClientConn) dnsSendLoop(transport net.PacketConn, addr net.Addr) error 
 // the VayDNS wire format and sends it via transport.
 //
 // VayDNS encoding:
-//   - Data query: [clientID:2][datalen:1][data]
-//   - Poll query: [clientID:2][nonce:4]
+//   - Data query: [clientID:N][datalen:1][data]
+//   - Poll query: [clientID:N][nonce:4]
 //
-// The encoded bytes are base32-encoded into at most one 63-byte label,
-// ensuring the query name fits through resolvers that strip multi-label prefixes.
+// The encoded bytes are base32-encoded into at most one label of MaxLabelLen
+// chars, ensuring the query passes through resolvers that strip multi-label
+// prefixes.
 func (c *ClientConn) sendDNS(transport net.PacketConn, p []byte, addr net.Addr) error {
 	var raw bytes.Buffer
 	raw.Write(c.dnsClientID[:])
@@ -223,18 +233,18 @@ func (c *ClientConn) sendDNS(transport net.PacketConn, p []byte, addr net.Addr) 
 		}
 		raw.WriteByte(byte(len(p)))
 		raw.Write(p)
+		log.Printf("dns: → data %d bytes (raw=%d encoded≤%d)", len(p), raw.Len()+1, c.cfg.MaxLabelLen)
 	} else {
-		// Poll: append random nonce for cache busting.
 		io.CopyN(&raw, rand.Reader, pollNonceLen)
+		log.Printf("dns: → poll (raw=%d encoded≤%d)", raw.Len(), c.cfg.MaxLabelLen)
 	}
 
 	encoded := make([]byte, base32Enc.EncodedLen(raw.Len()))
 	base32Enc.Encode(encoded, raw.Bytes())
 	encoded = bytes.ToLower(encoded)
 
-	// Limit to a single DNS label so the query passes through resolvers
-	// that strip multi-label prefixes.
 	if len(encoded) > c.cfg.MaxLabelLen {
+		log.Printf("dns: truncating label %d→%d chars", len(encoded), c.cfg.MaxLabelLen)
 		encoded = encoded[:c.cfg.MaxLabelLen]
 	}
 

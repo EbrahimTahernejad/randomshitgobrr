@@ -96,10 +96,12 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 		return fmt.Errorf("SetMtu(%d) failed", mtu)
 	}
 
+	log.Printf("KCP session %08x: noise handshake start", conn.GetConv())
 	rw, err := noise.NewClient(conn, pubkey)
 	if err != nil {
 		return fmt.Errorf("noise handshake: %v", err)
 	}
+	log.Printf("KCP session %08x: noise handshake done", conn.GetConv())
 
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
