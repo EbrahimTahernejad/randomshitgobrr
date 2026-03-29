@@ -2,16 +2,16 @@ package main
 
 import (
 	"bufio"
-	"encoding/binary"
 	"fmt"
 	"io"
-	"log"
 	"math/rand"
 	"net"
 	"os"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/dns/dnsmessage"
 
 	"github.com/user/randomshitgobrr/internal/hybrid"
 	"github.com/xtaci/kcp-go/v5"
@@ -21,23 +21,21 @@ import (
 )
 
 // runScanner executes the three-stage pipeline and writes results to out.
-// It updates stats as work progresses and calls stats.markDone() when finished.
 func runScanner(
 	ips []net.IP,
 	dnsPort int,
-	nsDomain, aDomain, tunnelDomain dns.Name,
+	aDomain string,
+	tunnelDomain dns.Name,
 	pubkey []byte,
 	cfg hybrid.Config,
 	dnsWorkers, hsWorkers int,
-	timeout time.Duration,
+	dnsTimeout, hsTimeout time.Duration,
 	out io.Writer,
 	stats *scanStats,
 ) {
 	var outMu sync.Mutex
 
-	// stage 1 → stage 2
 	ipChan := make(chan net.IP, dnsWorkers)
-	// stage 2 → stage 3
 	qualifiedChan := make(chan net.IP, hsWorkers)
 
 	// stage 1: feed IPs
@@ -48,14 +46,14 @@ func runScanner(
 		close(ipChan)
 	}()
 
-	// stage 2: DNS checks
+	// stage 2: A query check
 	var dnsWG sync.WaitGroup
 	for i := 0; i < dnsWorkers; i++ {
 		dnsWG.Add(1)
 		go func() {
 			defer dnsWG.Done()
 			for ip := range ipChan {
-				ok := dnsCheck2(ip.String(), dnsPort, nsDomain, aDomain, timeout)
+				ok := dnsCheckA(ip.String(), dnsPort, aDomain, dnsTimeout)
 				stats.recordDNS(ok)
 				if ok {
 					qualifiedChan <- ip
@@ -68,14 +66,14 @@ func runScanner(
 		close(qualifiedChan)
 	}()
 
-	// stage 3: handshake
+	// stage 3: Noise handshake
 	var hsWG sync.WaitGroup
 	for i := 0; i < hsWorkers; i++ {
 		hsWG.Add(1)
 		go func() {
 			defer hsWG.Done()
 			for ip := range qualifiedChan {
-				lat, err := doHandshake(ip, dnsPort, tunnelDomain, pubkey, cfg, timeout)
+				lat, err := doHandshake(ip, dnsPort, tunnelDomain, pubkey, cfg, hsTimeout)
 				passed := err == nil
 				stats.recordHS(ip.String(), lat, passed)
 				if passed {
@@ -90,50 +88,73 @@ func runScanner(
 	stats.markDone()
 }
 
-// dnsCheck2 checks both NS and A queries for ip.
-func dnsCheck2(ipStr string, dnsPort int, nsDomain, aDomain dns.Name, timeout time.Duration) bool {
-	return dnsCheck(ipStr, dnsPort, nsDomain, hybrid.RRTypeNS, timeout) &&
-		dnsCheck(ipStr, dnsPort, aDomain, hybrid.RRTypeA, timeout)
-}
-
-// dnsCheck sends one DNS query and returns true on NOERROR + at least one answer.
-func dnsCheck(resolverIP string, dnsPort int, name dns.Name, qtype uint16, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(resolverIP, fmt.Sprint(dnsPort)), timeout)
+// dnsCheckA sends a DNS A query to resolverIP:port using the standard
+// golang.org/x/net/dns/dnsmessage package (handles name compression correctly)
+// and returns true if the response is NOERROR with at least one A record.
+func dnsCheckA(resolverIP string, port int, name string, timeout time.Duration) bool {
+	conn, err := net.DialTimeout("udp", net.JoinHostPort(resolverIP, fmt.Sprint(port)), timeout)
 	if err != nil {
 		return false
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(timeout)) //nolint:errcheck
 
-	var id uint16
-	binary.Read(rand.New(rand.NewSource(rand.Int63())), binary.BigEndian, &id) //nolint:errcheck
-	query := &dns.Message{
-		ID:    id,
-		Flags: 0x0100,
-		Question: []dns.Question{
-			{Name: name, Type: qtype, Class: dns.ClassIN},
-		},
+	fqdn := name
+	if !strings.HasSuffix(fqdn, ".") {
+		fqdn += "."
 	}
-	buf, err := query.WireFormat()
+	qname, err := dnsmessage.NewName(fqdn)
 	if err != nil {
 		return false
 	}
-	if _, err := conn.Write(buf); err != nil {
-		return false
-	}
-	resp := make([]byte, 4096)
-	n, err := conn.Read(resp)
+
+	var buf [512]byte
+	b := dnsmessage.NewBuilder(buf[:0], dnsmessage.Header{
+		ID:               uint16(rand.Uint32()),
+		RecursionDesired: true,
+	})
+	b.StartQuestions() //nolint:errcheck
+	b.Question(dnsmessage.Question{ //nolint:errcheck
+		Name:  qname,
+		Type:  dnsmessage.TypeA,
+		Class: dnsmessage.ClassINET,
+	})
+	msg, err := b.Finish()
 	if err != nil {
 		return false
 	}
-	msg, err := dns.MessageFromWireFormat(resp[:n])
+
+	if _, err := conn.Write(msg); err != nil {
+		return false
+	}
+	var resp [4096]byte
+	n, err := conn.Read(resp[:])
 	if err != nil {
 		return false
 	}
-	return msg.Rcode() == dns.RcodeNoError && len(msg.Answer) > 0
+
+	var p dnsmessage.Parser
+	hdr, err := p.Start(resp[:n])
+	if err != nil {
+		return false
+	}
+	if hdr.RCode != dnsmessage.RCodeSuccess {
+		return false
+	}
+	p.SkipAllQuestions() //nolint:errcheck
+	for {
+		ah, err := p.AnswerHeader()
+		if err != nil {
+			return false // ErrSectionDone or parse error — no A record found
+		}
+		if ah.Type == dnsmessage.TypeA {
+			return true
+		}
+		p.SkipAnswer() //nolint:errcheck
+	}
 }
 
-// doHandshake opens a hybrid ClientConn through ip as the DNS relay and times
+// doHandshake opens a hybrid ClientConn through ip as DNS relay and times
 // the Noise NK handshake.
 func doHandshake(ip net.IP, dnsPort int, tunnelDomain dns.Name, pubkey []byte, cfg hybrid.Config, timeout time.Duration) (time.Duration, error) {
 	resolver, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip.String(), fmt.Sprint(dnsPort)))
@@ -172,8 +193,7 @@ func doHandshake(ip net.IP, dnsPort int, tunnelDomain dns.Name, pubkey []byte, c
 	return time.Since(start), nil
 }
 
-// loadAndSample reads IPs and CIDR ranges from filename, reservoir-samples up
-// to n of them, and returns warnings for any unparseable lines.
+// loadAndSample reads IPs and CIDR ranges, reservoir-samples up to n of them.
 // Memory usage is O(n) regardless of list size.
 func loadAndSample(filename string, n int) ([]net.IP, []string, error) {
 	f, err := os.Open(filename)
@@ -264,6 +284,3 @@ func incrementIP(ip net.IP) {
 		}
 	}
 }
-
-// suppress unused import warning — log is used by callers in main.go
-var _ = log.Printf
