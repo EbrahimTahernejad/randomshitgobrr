@@ -31,12 +31,13 @@ const (
 // ServerTransport manages the server side of the hybrid tunnel.
 // DNS queries carry upstream KCP packets; ICMP Echo Requests carry downstream.
 type ServerTransport struct {
+	cfg        Config
 	domain     dns.Name
 	destIP     net.IP // client's public IP — destination of downstream ICMP
 	spoofSrcIP net.IP
 	ttConn     *turbotunnel.QueuePacketConn
 
-	rawFd    int            // IPv4 raw socket for spoofed ICMP (IP_HDRINCL)
+	rawFd    int              // IPv4 raw socket for spoofed ICMP (IP_HDRINCL)
 	icmpConn *icmp.PacketConn // normal ICMP send (no spoofing)
 	icmpSeq  atomic.Uint32
 
@@ -49,8 +50,10 @@ type ServerTransport struct {
 // If spoofSrcIP is non-nil, downstream ICMP packets have it as their source address
 // (requires root/CAP_NET_RAW and a raw socket with IP_HDRINCL).
 // If spoofSrcIP is nil, ICMP is sent normally (source IP from OS routing).
-func NewServerTransport(domain dns.Name, destIP net.IP, spoofSrcIP net.IP, ttConn *turbotunnel.QueuePacketConn) (*ServerTransport, error) {
+// cfg must match the Config used by the client.
+func NewServerTransport(domain dns.Name, destIP net.IP, spoofSrcIP net.IP, ttConn *turbotunnel.QueuePacketConn, cfg Config) (*ServerTransport, error) {
 	st := &ServerTransport{
+		cfg:        cfg,
 		domain:     domain,
 		destIP:     destIP,
 		spoofSrcIP: spoofSrcIP,
@@ -118,11 +121,17 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 		return
 	}
 
-	var clientID turbotunnel.ClientID
-	n := copy(clientID[:], payload)
-	payload = payload[n:]
+	// VayDNS wire format: [clientID:N][datalen:1][data]... or [clientID:N][nonce:4] for polls.
+	if len(payload) < st.cfg.ClientIDLen {
+		if resp.Rcode() == dns.RcodeNoError {
+			resp.Flags |= dns.RcodeNameError
+		}
+	} else {
+		// Extract the client ID and zero-pad to turbotunnel.ClientID ([8]byte).
+		var clientID turbotunnel.ClientID
+		copy(clientID[:], payload[:st.cfg.ClientIDLen])
+		payload = payload[st.cfg.ClientIDLen:]
 
-	if n == len(clientID) {
 		st.mu.Lock()
 		if _, known := st.clientIPs[clientID]; !known {
 			st.clientIPs[clientID] = st.destIP
@@ -131,21 +140,15 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 		st.mu.Unlock()
 		// Feed upstream KCP packets from the DNS query payload.
 		r := bytes.NewReader(payload)
-		nPkts := 0
 		for {
-			p, err := serverNextPacket(r)
+			p, err := vaydnsNextPacket(r)
 			if err != nil {
 				break
 			}
-			nPkts++
-			log.Printf("handleQuery: clientID=%s queuing KCP packet %d bytes", clientID, len(p))
-			st.ttConn.QueueIncoming(p, clientID)
+			if len(p) > 0 {
+				st.ttConn.QueueIncoming(p, clientID)
+			}
 		}
-		if nPkts == 0 {
-			log.Printf("handleQuery: clientID=%s poll (no KCP data)", clientID)
-		}
-	} else if resp.Rcode() == dns.RcodeNoError {
-		resp.Flags |= dns.RcodeNameError
 	}
 
 	// Send an empty DNS response — downstream data goes via ICMP.
@@ -209,11 +212,11 @@ func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP 
 
 		// Bundle greedily up to icmpBundleMax bytes.
 		var payload bytes.Buffer
-		payload.Write(clientID[:])
+		payload.Write(clientID[:st.cfg.ClientIDLen]) // client ID prefix
 		for p != nil {
 			// Only check limit after the first packet; let oversized packets
 			// through so they are at least attempted once.
-			if payload.Len() > 8 && payload.Len()+2+len(p) > icmpBundleMax {
+			if payload.Len() > st.cfg.ClientIDLen && payload.Len()+2+len(p) > icmpBundleMax {
 				overflow = p
 				break
 			}
@@ -226,9 +229,7 @@ func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP 
 			}
 		}
 
-		pld := payload.Bytes()
-		log.Printf("icmpSendLoop: sending %d bytes to %v", len(pld), clientIP)
-		if err := st.sendICMP(pld, clientIP); err != nil {
+		if err := st.sendICMP(payload.Bytes(), clientIP); err != nil {
 			log.Printf("ICMP send to %v: %v", clientIP, err)
 		}
 	}
@@ -261,7 +262,7 @@ func (st *ServerTransport) sendICMPSpoofed(payload []byte, dstIP net.IP) error {
 	}
 	icmpLayer := &layers.ICMPv4{
 		TypeCode: layers.CreateICMPv4TypeCode(layers.ICMPv4TypeEchoRequest, 0),
-		Id:       IcmpID,
+		Id:       uint16(st.cfg.IcmpID),
 		Seq:      seq,
 	}
 	buf := gopacket.NewSerializeBuffer()
@@ -283,7 +284,7 @@ func (st *ServerTransport) sendICMPNormal(payload []byte, dstIP net.IP) error {
 		Type: ipv4.ICMPTypeEcho,
 		Code: 0,
 		Body: &icmp.Echo{
-			ID:   IcmpID,
+			ID:   st.cfg.IcmpID,
 			Seq:  int(seq),
 			Data: payload,
 		},
@@ -371,34 +372,18 @@ func responseFor(query *dns.Message, domain dns.Name) (*dns.Message, []byte) {
 	return resp, payload
 }
 
-// serverNextPacket reads the next data packet from r, skipping padding bytes.
-// Padding is encoded with a prefix byte >= 0xe0 (length = prefix - 0xe0).
-// Data is encoded with a prefix byte < 0xe0 (length = prefix).
-// This matches the encoding used by the hybrid client's sendDNS method.
-func serverNextPacket(r *bytes.Reader) ([]byte, error) {
-	wrap := func(err error) error {
-		if err == io.EOF {
-			return io.ErrUnexpectedEOF
-		}
-		return err
+// vaydnsNextPacket reads the next data packet from r using the VayDNS wire
+// format: [datalen:1][data]. Returns io.EOF only when 0 bytes remain in r.
+func vaydnsNextPacket(r *bytes.Reader) ([]byte, error) {
+	prefix, err := r.ReadByte()
+	if err != nil {
+		return nil, err // may return real io.EOF here
 	}
-	for {
-		prefix, err := r.ReadByte()
-		if err != nil {
-			return nil, err // may return real io.EOF here
-		}
-		if prefix >= 224 {
-			paddingLen := int64(prefix - 224)
-			if _, err := io.CopyN(io.Discard, r, paddingLen); err != nil {
-				return nil, wrap(err)
-			}
-		} else {
-			p := make([]byte, int(prefix))
-			if _, err := io.ReadFull(r, p); err != nil {
-				return nil, wrap(err)
-			}
-			return p, nil
-		}
+	p := make([]byte, int(prefix))
+	_, err = io.ReadFull(r, p)
+	if err == io.EOF {
+		err = io.ErrUnexpectedEOF
 	}
+	return p, err
 }
 

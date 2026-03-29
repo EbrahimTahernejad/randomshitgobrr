@@ -71,18 +71,13 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	return nil
 }
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, transport net.PacketConn) error {
+func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, transport net.PacketConn, cfg hybrid.Config) error {
 	defer transport.Close()
 
-	// KCP MTU is constrained by the DNS query name capacity (upstream).
-	// Downstream ICMP can carry larger payloads; it bundles multiple KCP packets.
-	mtu := hybrid.DNSNameCapacity(domain) - 8 - 1 - 3 - 1
-	if mtu < 80 {
-		return fmt.Errorf("domain %s leaves only %d bytes for KCP payload", domain, mtu)
-	}
-	log.Printf("KCP MTU %d", mtu)
+	mtu := cfg.MaxKCPMTU()
+	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen)
 
-	pconn, err := hybrid.NewClientConn(transport, remoteAddr, domain)
+	pconn, err := hybrid.NewClientConn(transport, remoteAddr, domain, cfg)
 	if err != nil {
 		return fmt.Errorf("hybrid conn: %v", err)
 	}
@@ -153,11 +148,16 @@ func main() {
 	var dohURL, dotAddr, udpAddr string
 	var pubkeyFile, pubkeyHex string
 
+	defCfg := hybrid.DefaultConfig()
+	var clientIDLen, icmpID, maxLabelLen int
 	flag.StringVar(&dohURL, "doh", "", "DNS-over-HTTPS resolver URL")
 	flag.StringVar(&dotAddr, "dot", "", "DNS-over-TLS resolver address")
 	flag.StringVar(&udpAddr, "udp", "", "UDP DNS resolver address")
 	flag.StringVar(&pubkeyFile, "pubkey-file", "", "server public key file")
 	flag.StringVar(&pubkeyHex, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
+	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "bytes used as DNS/ICMP session ID (must match server)")
+	flag.IntVar(&icmpID, "icmp-id", defCfg.IcmpID, "ICMP Echo identifier for tunnel packets (must match server)")
+	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match server)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-udp ADDR|-doh URL|-dot ADDR] -pubkey-file FILE DOMAIN LOCALADDR\n\n", os.Args[0])
 		flag.PrintDefaults()
@@ -236,7 +236,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(pubkey, domain, localAddr, remoteAddr, transport); err != nil {
+	cfg := hybrid.Config{
+		ClientIDLen: clientIDLen,
+		IcmpID:      icmpID,
+		MaxLabelLen: maxLabelLen,
+	}
+	if err := run(pubkey, domain, localAddr, remoteAddr, transport, cfg); err != nil {
 		log.Fatal(err)
 	}
 }

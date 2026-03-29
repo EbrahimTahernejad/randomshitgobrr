@@ -77,13 +77,10 @@ func handleStream(stream *smux.Stream, upstream string, conv uint32) error {
 }
 
 func acceptStreams(conn *kcp.UDPSession, privkey []byte, upstream string) error {
-	log.Printf("session %08x: noise handshake starting", conn.GetConv())
 	rw, err := noise.NewServer(conn, privkey)
 	if err != nil {
-		log.Printf("session %08x: noise handshake error: %v", conn.GetConv(), err)
 		return err
 	}
-	log.Printf("session %08x: noise handshake done", conn.GetConv())
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	smuxConfig.KeepAliveTimeout = idleTimeout
@@ -142,18 +139,15 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 	}
 }
 
-func run(privkey []byte, domain dns.Name, destIP net.IP, spoofSrcIP net.IP, upstream string, dnsConn net.PacketConn) error {
+func run(privkey []byte, domain dns.Name, destIP net.IP, spoofSrcIP net.IP, upstream string, dnsConn net.PacketConn, cfg hybrid.Config) error {
 	defer dnsConn.Close()
 
-	mtu := hybrid.DNSNameCapacity(domain) - 8 - 1 - 3 - 1
-	if mtu < 80 {
-		return fmt.Errorf("domain %s leaves only %d bytes for KCP payload", domain, mtu)
-	}
-	log.Printf("KCP MTU %d", mtu)
+	mtu := cfg.MaxKCPMTU()
+	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen)
 	log.Printf("server pubkey %x", noise.PubkeyFromPrivkey(privkey))
 
 	ttConn := turbotunnel.NewQueuePacketConn(turbotunnel.DummyAddr{}, idleTimeout*2)
-	st, err := hybrid.NewServerTransport(domain, destIP, spoofSrcIP, ttConn)
+	st, err := hybrid.NewServerTransport(domain, destIP, spoofSrcIP, ttConn, cfg)
 	if err != nil {
 		return err
 	}
@@ -226,6 +220,8 @@ func main() {
 	var privFile, pubFile, privkeyHex string
 	var udpAddr, destIPStr, spoofSrcStr string
 
+	defCfg := hybrid.DefaultConfig()
+	var clientIDLen, icmpID, maxLabelLen int
 	flag.BoolVar(&genKey, "gen-key", false, "generate a server keypair")
 	flag.StringVar(&privFile, "privkey-file", "", "server private key file")
 	flag.StringVar(&pubFile, "pubkey-file", "", "server public key file (with -gen-key)")
@@ -233,6 +229,9 @@ func main() {
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen for DNS queries (required)")
 	flag.StringVar(&destIPStr, "dest-ip", "", "client's public IPv4 address to send downstream ICMP to (required)")
 	flag.StringVar(&spoofSrcStr, "spoof-src", "", "spoofed source IP for downstream ICMP (leave empty for normal ICMP)")
+	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "bytes used as DNS/ICMP session ID (must match client)")
+	flag.IntVar(&icmpID, "icmp-id", defCfg.IcmpID, "ICMP Echo identifier for tunnel packets (must match client)")
+	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match client)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n  %s -gen-key [-privkey-file FILE] [-pubkey-file FILE]\n  %s -udp ADDR -dest-ip IP [-privkey-file FILE] [-spoof-src IP] DOMAIN UPSTREAMADDR\n\n", os.Args[0], os.Args[0])
 		flag.PrintDefaults()
@@ -306,7 +305,12 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := run(privkey, domain, destIP, spoofSrcIP, upstream, dnsConn); err != nil {
+	cfg := hybrid.Config{
+		ClientIDLen: clientIDLen,
+		IcmpID:      icmpID,
+		MaxLabelLen: maxLabelLen,
+	}
+	if err := run(privkey, domain, destIP, spoofSrcIP, upstream, dnsConn, cfg); err != nil {
 		log.Fatal(err)
 	}
 }
