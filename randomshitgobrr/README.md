@@ -1,9 +1,10 @@
 # randomshitgobrr
 
-A hybrid DNS+ICMP tunnel using KCP for reliable transport.
+A hybrid DNS+ICMP/UDP tunnel using KCP for reliable transport.
 
-**Upstream (client → server):** DNS TXT queries encoded in the VayDNS single-label wire format — each query fits in one DNS label so it passes through resolvers that strip multi-label prefixes.
-**Downstream (server → client):** ICMP Echo Requests with optional spoofed source IP — faster than DNS, exploits the fact that outside→inside ICMP is often unrestricted.
+**Upstream (client → server):** DNS TXT queries encoded in the VayDNS single-label wire format — each query fits in one DNS label so it passes through resolvers that strip multi-label prefixes. Multiple resolvers can be specified for round-robin or redundant sending.
+
+**Downstream (server → client):** Either ICMP Echo Requests or raw spoofed UDP packets, both with optional spoofed source IP. ICMP exploits the fact that outside→inside ICMP is often unrestricted. UDP can pass through firewalls that block ICMP and requires no raw socket on the client.
 
 Stack: KCP → Noise NK (encryption) → SMUX (multiplexing) → TCP
 
@@ -21,7 +22,7 @@ This project is built on top of existing tools:
 
 ## Requirements
 
-- Both sides: **root** or `CAP_NET_RAW`
+- Both sides: **root** or `CAP_NET_RAW` (ICMP mode) — UDP mode only requires root on the **server**
 - Server: port 53 UDP, a domain with NS record pointing to the server
 - Go 1.21+ (to build from source)
 
@@ -67,27 +68,24 @@ Copy `server.pub` to the client machine.
 | Flag | Required | Description |
 |------|----------|-------------|
 | `-udp` | yes | UDP address to listen for DNS queries |
-| `-dest-ip` | yes | Client's public IPv4 — where to send downstream ICMP |
+| `-dest-ip` | yes | Client's public IPv4 — where to send downstream traffic |
 | `-privkey-file` | recommended | Private key file (omit to generate a temporary key) |
-| `-spoof-src` | no | Source IP to spoof in downstream ICMP packets (e.g. `1.1.1.1`). Omit for normal ICMP. |
-| `-client-id-len` | no | Bytes used as DNS/ICMP session ID. Default: `2`. **Must match client.** |
-| `-icmp-id` | no | ICMP Echo identifier for tunnel packets. Default: `0x5350`. **Must match client.** |
+| `-spoof-src` | no | Source IP to spoof in downstream ICMP/UDP packets. Omit for normal send. |
+| `-downstream-udp-port` | no | Switch downstream from ICMP to raw UDP; client listens on this port. **Must match client.** Default: `0` (ICMP). |
+| `-downstream-udp-src-port` | no | Source port for spoofed downstream UDP packets. Number or `random`. Default: `random`. |
+| `-client-id-len` | no | Bytes used as session ID. Default: `2`. **Must match client.** |
+| `-icmp-id` | no | ICMP Echo identifier. Default: `0x5350`. **Must match client.** |
 | `-max-label-len` | no | Max base32 chars per DNS label. Default: `63`. **Must match client.** |
-| `-record-type` | no | DNS query type to accept: `txt`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`. Default: `txt`. **Must match client.** |
+| `-record-type` | no | DNS query type: `txt`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`. Default: `txt`. **Must match client.** |
 | `DOMAIN` | yes | Tunnel domain (must match NS delegation) |
 | `UPSTREAM` | yes | TCP address to forward tunneled connections to |
 
-**Suppress kernel ICMP auto-replies** so the OS doesn't respond to the ICMP on behalf of the spoofed source IP:
+**ICMP mode only — suppress kernel ICMP auto-replies:**
 
 ```bash
 echo 1 > /proc/sys/net/ipv4/icmp_echo_ignore_all
-```
-
-Make it permanent:
-
-```bash
-echo "net.ipv4.icmp_echo_ignore_all = 1" >> /etc/sysctl.conf
-sysctl -p
+# permanent:
+echo "net.ipv4.icmp_echo_ignore_all = 1" >> /etc/sysctl.conf && sysctl -p
 ```
 
 ---
@@ -102,31 +100,70 @@ sysctl -p
   127.0.0.1:7000
 ```
 
+**Multiple resolvers (round-robin):**
+
+```bash
+./bin/hybrid-client \
+  -udp 8.8.8.8:53 -udp 1.1.1.1:53 -udp 9.9.9.9:53 \
+  -broadcast 2 \
+  -pubkey-file server.pub \
+  t.example.com \
+  127.0.0.1:7000
+```
+
 | Flag | Required | Description |
 |------|----------|-------------|
-| `-udp` | one of three | UDP DNS resolver (e.g. `8.8.8.8:53`) |
-| `-doh` | one of three | DNS-over-HTTPS resolver URL (e.g. `https://dns.google/dns-query`) |
-| `-dot` | one of three | DNS-over-TLS resolver address (e.g. `dns.google:853`) |
+| `-udp` | one of three | UDP DNS resolver (repeatable for round-robin, e.g. `-udp 8.8.8.8:53 -udp 1.1.1.1:53`) |
+| `-doh` | one of three | DNS-over-HTTPS resolver URL |
+| `-dot` | one of three | DNS-over-TLS resolver address |
+| `-broadcast` | no | Number of resolvers to send each packet to. `1` = strict round-robin. Default: `1`. |
 | `-pubkey-file` | yes | Server public key file |
-| `-client-id-len` | no | Bytes used as DNS/ICMP session ID. Default: `2`. **Must match server.** |
-| `-icmp-id` | no | ICMP Echo identifier for tunnel packets. Default: `0x5350`. **Must match server.** |
+| `-downstream-udp-port` | no | Listen on this UDP port for downstream from server (instead of ICMP). **Must match server.** Default: `0` (ICMP). |
+| `-client-id-len` | no | Bytes used as session ID. Default: `2`. **Must match server.** |
+| `-icmp-id` | no | ICMP Echo identifier. Default: `0x5350`. **Must match server.** |
 | `-max-label-len` | no | Max base32 chars per DNS label. Default: `63`. **Must match server.** |
-| `-record-type` | no | DNS query type: `txt`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`. Default: `txt`. **Must match server.** |
+| `-record-type` | no | DNS query type. Default: `txt`. **Must match server.** |
 | `DOMAIN` | yes | Tunnel domain (must match server) |
 | `LOCALADDR` | yes | Local TCP address to listen on — connect your app here |
 
 ---
 
+## Downstream modes
+
+### ICMP (default)
+
+The server sends KCP segments as ICMP Echo Requests to `-dest-ip`. The client reads them via a raw ICMP socket (requires `CAP_NET_RAW` on client).
+
+### UDP (`-downstream-udp-port`)
+
+The server builds raw IP+UDP packets with a spoofed source address and sends them to `<CLIENT_IP>:<downstream-udp-port>`. The client binds a plain UDP socket on that port — **no raw socket privilege needed on the client**.
+
+The source port defaults to `random` (a fresh ephemeral port per packet) but can be fixed to a specific port (e.g. `53` to look like a DNS response) with `-downstream-udp-src-port 53`.
+
+```bash
+# server
+hybrid-server -udp :53 -dest-ip 1.2.3.4 -spoof-src 5.6.7.8 \
+  -downstream-udp-port 5555 \
+  -privkey-file server.key t.example.com 127.0.0.1:8000
+
+# client (no CAP_NET_RAW required)
+hybrid-client -udp 5.6.7.8:53 -downstream-udp-port 5555 \
+  -pubkey-file server.pub t.example.com 127.0.0.1:7000
+```
+
+---
+
 ## Wire-protocol flags
 
-The three `-client-id-len`, `-icmp-id`, and `-max-label-len` flags must be **identical on both sides**. Mismatches cause silent failures:
+The flags `-client-id-len`, `-icmp-id`, `-max-label-len`, `-record-type`, and `-downstream-udp-port` must be **identical on both sides**. Mismatches cause silent failures:
 
 | Flag | Mismatch effect |
 |------|----------------|
-| `-client-id-len` | Server reads wrong prefix length from DNS; ICMP filter fails on client |
+| `-client-id-len` | Server reads wrong prefix length from DNS; downstream filter fails on client |
 | `-icmp-id` | Client ignores all downstream ICMP (ID mismatch) |
 | `-max-label-len` | Client truncates queries at a different boundary than server decodes |
 | `-record-type` | Server returns NXDOMAIN for every query; tunnel never establishes |
+| `-downstream-udp-port` | Server sends UDP to wrong port or client listens on wrong port |
 
 The KCP MTU is derived automatically: `floor(max-label-len × 5/8) − client-id-len − 1`. With defaults this is **36 bytes** per segment, which base32-encodes to exactly 63 characters — one DNS label.
 
@@ -168,29 +205,29 @@ git submodule update --init
 ## How it works
 
 ```
-Client                                  Server
-──────────────────────────────────────────────────────────────
+Client                                    Server
+────────────────────────────────────────────────────────────────
 App → TCP
       └→ SMUX stream
            └→ Noise NK (encrypted)
                 └→ KCP (reliable, MTU=36)
-                     └→ DNS TXT query        ──────────────→  UDP :53
-                        [clientID:2][len:1][data]                   ↓
-                        one 63-char base32 label            Decode VayDNS format
-                        per KCP segment                     Feed KCP segment
-                                                                    ↓
-                                                            KCP → Noise → SMUX → TCP → Upstream
+                     └→ DNS TXT query          ──────────────→  UDP :53
+                        [clientID:2][len:1][data]                     ↓
+                        one 63-char base32 label              Decode VayDNS format
+                        per KCP segment                       Feed KCP segment
+                        (round-robin / broadcast                      ↓
+                         across multiple resolvers)           KCP → Noise → SMUX → TCP → Upstream
 
-                     ←── ICMP Echo Request (optional spoofed src)  ←─ Raw socket
-                         [clientID:2][len:2][KCP]...
-                         multiple KCP segments bundled per datagram
+          ICMP mode:
+          ←── ICMP Echo Request (optional spoofed src)  ←─ Raw socket
+              [clientID:2][uint16-len][KCP]...
+              multiple KCP segments bundled per datagram
+
+          UDP mode:
+          ←── Raw IP+UDP (spoofed src IP+port)          ←─ Raw socket
+              [clientID:2][uint16-len][KCP]...
+              same bundling, no CAP_NET_RAW on client
 ```
-
-**Upstream (DNS):** Each KCP segment is encoded as `[clientID:2][datalen:1][data]` and base32-encoded into a single DNS label (≤63 chars). Limiting to one label ensures the query reaches the authoritative nameserver through resolvers that strip multi-label prefixes.
-
-**Downstream (ICMP):** The server sends KCP segments back as ICMP Echo Requests addressed to `-dest-ip`. The ICMP payload starts with the 2-byte client ID so the client can filter its own session. Multiple KCP segments are bundled into one datagram (up to 1400 bytes).
-
-**KCP MTU = 36:** With 24-byte KCP header + 12 bytes of application data per segment, large messages (e.g. the Noise handshake) are fragmented into several segments, each fitting in one DNS label. KCP reassembles them on the other side.
 
 ---
 
