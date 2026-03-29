@@ -91,8 +91,17 @@ func runScanner(
 // dnsCheckA sends a DNS A query to resolverIP:port using the standard
 // golang.org/x/net/dns/dnsmessage package (handles name compression correctly)
 // and returns true if the response is NOERROR with at least one A record.
+//
+// Uses an unconnected UDP socket (ListenUDP + WriteTo/ReadFrom) so that ICMP
+// port-unreachable messages from intermediate hops do NOT cause an immediate
+// ECONNREFUSED — a connected UDP socket would surface those errors instantly,
+// causing all checks to fail even for real resolvers behind lossy paths.
 func dnsCheckA(resolverIP string, port int, name string, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(resolverIP, fmt.Sprint(port)), timeout)
+	dst, err := net.ResolveUDPAddr("udp", net.JoinHostPort(resolverIP, fmt.Sprint(port)))
+	if err != nil {
+		return false
+	}
+	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		return false
 	}
@@ -124,11 +133,11 @@ func dnsCheckA(resolverIP string, port int, name string, timeout time.Duration) 
 		return false
 	}
 
-	if _, err := conn.Write(msg); err != nil {
+	if _, err := conn.WriteTo(msg, dst); err != nil {
 		return false
 	}
 	var resp [4096]byte
-	n, err := conn.Read(resp[:])
+	n, _, err := conn.ReadFrom(resp[:])
 	if err != nil {
 		return false
 	}
