@@ -33,7 +33,7 @@ jobs:
           # spoof-tunnel is on GitHub — shallow clone is fine
           git submodule update --init --depth=1 spoof-tunnel
           # dnstt uses dumb HTTP which doesn't support shallow clones
-          git submodule update --init dnstt
+          git submodule update --init --depth=1 vaydns
 
       - name: Set up Go
         uses: actions/setup-go@v5
