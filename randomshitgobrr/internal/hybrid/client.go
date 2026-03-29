@@ -127,7 +127,9 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 			continue
 		}
 		if !bytes.Equal(data[:len(idBytes)], idBytes) {
-			log.Printf("icmpRecvLoop: clientID mismatch from %v (got %x, want %s)", src, data[:len(idBytes)], c.clientID)
+			if c.cfg.Verbose {
+				log.Printf("icmpRecvLoop: clientID mismatch from %v (got %x, want %s)", src, data[:len(idBytes)], c.clientID)
+			}
 			continue
 		}
 
@@ -150,7 +152,9 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 			c.QueuePacketConn.QueueIncoming(p, turbotunnel.DummyAddr{})
 		}
 		if count > 0 {
-			log.Printf("icmpRecvLoop: accepted from %v: %d KCP packet(s), %d bytes total", src, count, totalBytes)
+			if c.cfg.Verbose {
+				log.Printf("icmpRecvLoop: accepted from %v: %d KCP packet(s), %d bytes total", src, count, totalBytes)
+			}
 			select {
 			case c.pollChan <- struct{}{}:
 			default:
@@ -228,10 +232,14 @@ func (c *ClientConn) sendDNS(transport net.PacketConn, p []byte, addr net.Addr) 
 		}
 		raw.WriteByte(byte(len(p)))
 		raw.Write(p)
-		log.Printf("dns: → data %d bytes (raw=%d encoded≤%d)", len(p), raw.Len(), c.cfg.MaxLabelLen)
+		if c.cfg.Verbose {
+			log.Printf("dns: → data %d bytes (raw=%d encoded≤%d)", len(p), raw.Len(), c.cfg.MaxLabelLen)
+		}
 	} else {
 		io.CopyN(&raw, rand.Reader, pollNonceLen)
-		log.Printf("dns: → poll (raw=%d encoded≤%d)", raw.Len(), c.cfg.MaxLabelLen)
+		if c.cfg.Verbose {
+			log.Printf("dns: → poll (raw=%d encoded≤%d)", raw.Len(), c.cfg.MaxLabelLen)
+		}
 	}
 
 	encoded := make([]byte, base32Enc.EncodedLen(raw.Len()))

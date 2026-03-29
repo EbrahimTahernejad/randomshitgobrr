@@ -148,6 +148,7 @@ func readKey(filename string) ([]byte, error) {
 func main() {
 	var dohURL, dotAddr, udpAddr string
 	var pubkeyFile, pubkeyHex string
+	var verbose bool
 
 	defCfg := hybrid.DefaultConfig()
 	var clientIDLen, icmpID, maxLabelLen int
@@ -161,6 +162,7 @@ func main() {
 	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match server)")
 	var recordTypeStr string
 	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS query type: txt, cname, a, aaaa, mx, ns, srv (must match server)")
+	flag.BoolVar(&verbose, "verbose", false, "enable per-packet diagnostic logging")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-udp ADDR|-doh URL|-dot ADDR] -pubkey-file FILE DOMAIN LOCALADDR\n\n", os.Args[0])
 		flag.PrintDefaults()
@@ -249,6 +251,7 @@ func main() {
 		IcmpID:      icmpID,
 		MaxLabelLen: maxLabelLen,
 		RecordType:  recordType,
+		Verbose:     verbose,
 	}
 	if err := run(pubkey, domain, localAddr, remoteAddr, transport, cfg); err != nil {
 		log.Fatal(err)

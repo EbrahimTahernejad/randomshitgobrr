@@ -62,6 +62,10 @@ type Config struct {
 	// Use ParseRecordType to convert a flag string to this value.
 	// Default: RRTypeTXT (16).
 	RecordType uint16
+
+	// Verbose enables per-packet diagnostic logging (DNS sends, ICMP
+	// receives, KCP bundle stats). Disabled by default; enable with -verbose.
+	Verbose bool
 }
 
 // DefaultConfig returns a Config with production-ready defaults.

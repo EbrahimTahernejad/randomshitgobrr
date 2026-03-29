@@ -149,7 +149,9 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 		// Feed upstream KCP packets from the DNS query payload.
 		if len(payload) <= pollNonceLen+1 {
 			// Poll query: payload is just a nonce, no data.
-			log.Printf("handleQuery: poll from %x @ %v (payload=%d bytes)", dnsClientID, addr, len(payload))
+			if st.cfg.Verbose {
+				log.Printf("handleQuery: poll from %x @ %v (payload=%d bytes)", dnsClientID, addr, len(payload))
+			}
 		} else {
 			r := bytes.NewReader(payload)
 			count := 0
@@ -165,7 +167,9 @@ func (st *ServerTransport) handleQuery(buf []byte, addr net.Addr, dnsConn net.Pa
 					totalBytes += len(p)
 				}
 			}
-			log.Printf("handleQuery: data from %x @ %v: %d KCP packet(s), %d bytes queued", dnsClientID, addr, count, totalBytes)
+			if st.cfg.Verbose {
+				log.Printf("handleQuery: data from %x @ %v: %d KCP packet(s), %d bytes queued", dnsClientID, addr, count, totalBytes)
+			}
 		}
 	}
 
@@ -258,7 +262,9 @@ func (st *ServerTransport) icmpSendLoop(clientID turbotunnel.ClientID, clientIP 
 			sr.Seek(int64(l), io.SeekCurrent)
 			pktCount++
 		}
-		log.Printf("icmpSendLoop: → %v: %d KCP packet(s), %d bytes payload", clientIP, pktCount, payload.Len())
+		if st.cfg.Verbose {
+			log.Printf("icmpSendLoop: → %v: %d KCP packet(s), %d bytes payload", clientIP, pktCount, payload.Len())
+		}
 		if err := st.sendICMP(payload.Bytes(), clientIP); err != nil {
 			log.Printf("ICMP send to %v: %v", clientIP, err)
 		}

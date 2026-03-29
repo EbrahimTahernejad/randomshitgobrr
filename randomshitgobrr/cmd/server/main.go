@@ -222,6 +222,7 @@ func main() {
 	var genKey bool
 	var privFile, pubFile, privkeyHex string
 	var udpAddr, destIPStr, spoofSrcStr string
+	var verbose bool
 
 	defCfg := hybrid.DefaultConfig()
 	var clientIDLen, icmpID, maxLabelLen int
@@ -237,6 +238,7 @@ func main() {
 	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match client)")
 	var recordTypeStr string
 	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS query type to accept: txt, cname, a, aaaa, mx, ns, srv (must match client)")
+	flag.BoolVar(&verbose, "verbose", false, "enable per-packet diagnostic logging")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage:\n  %s -gen-key [-privkey-file FILE] [-pubkey-file FILE]\n  %s -udp ADDR -dest-ip IP [-privkey-file FILE] [-spoof-src IP] DOMAIN UPSTREAMADDR\n\n", os.Args[0], os.Args[0])
 		flag.PrintDefaults()
@@ -320,6 +322,7 @@ func main() {
 		IcmpID:      icmpID,
 		MaxLabelLen: maxLabelLen,
 		RecordType:  recordType,
+		Verbose:     verbose,
 	}
 	if err := run(privkey, domain, destIP, spoofSrcIP, upstream, dnsConn, cfg); err != nil {
 		log.Fatal(err)
