@@ -185,13 +185,64 @@ The client accepts TCP connections on `LOCALADDR` and forwards them through the 
 
 ---
 
+## Scanner
+
+`hybrid-scanner` finds working DNS resolvers for the tunnel by probing IPs from a list. For each sampled IP it:
+
+1. Sends an NS query — must return an answer
+2. Sends an A query — must return an answer
+3. Runs a full Noise handshake through the IP as a DNS relay and records the latency
+
+Passing IPs are written to a CSV with their handshake time.
+
+```bash
+hybrid-scanner \
+  -list ranges.txt \
+  -sample 500 \
+  -ns example.com \
+  -a example.com \
+  -domain t.example.com \
+  -pubkey-file server.pub \
+  -workers 100 \
+  -timeout 8s \
+  -output results.csv
+```
+
+`ranges.txt` accepts CIDRs and individual IPs (lines starting with `#` are ignored):
+
+```
+8.8.8.0/24
+1.1.1.1
+9.9.9.0/28
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-list` | — | IP/CIDR list file (required) |
+| `-sample` | `100` | IPs to randomly sample |
+| `-ns` | — | Domain for NS query check (required) |
+| `-a` | — | Domain for A query check (required) |
+| `-domain` | — | Tunnel domain for handshake (required) |
+| `-pubkey-file` / `-pubkey` | — | Server public key |
+| `-workers` | `50` | Concurrent probes |
+| `-timeout` | `10s` | Per-IP timeout |
+| `-dns-port` | `53` | DNS port on scanned IPs |
+| `-output` | `results.csv` | Output file |
+
+Output format: `ip,latency_ms`
+
+Requires root/`CAP_NET_RAW` (opens a raw ICMP socket per worker for the handshake).
+
+---
+
 ## Building from source
 
 ```bash
 git clone --recurse-submodules <repo>
 cd randomshitgobrr/randomshitgobrr
-go build -o bin/hybrid-server ./cmd/server
-go build -o bin/hybrid-client ./cmd/client
+go build -o bin/hybrid-server  ./cmd/server
+go build -o bin/hybrid-client  ./cmd/client
+go build -o bin/hybrid-scanner ./cmd/scanner
 ```
 
 If you cloned without `--recurse-submodules`:
