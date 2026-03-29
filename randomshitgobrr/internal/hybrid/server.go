@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -396,8 +397,12 @@ func (st *ServerTransport) sendUDPSpoofed(payload []byte, dstIP net.IP) error {
 		SrcIP:    net.IP(src4),
 		DstIP:    net.IP(dst4),
 	}
+	srcPort := st.cfg.UDPSrcPort
+	if srcPort == 0 {
+		srcPort = 1024 + rand.Intn(64512) // ephemeral range
+	}
 	udpLayer := &layers.UDP{
-		SrcPort: layers.UDPPort(st.cfg.UDPSrcPort),
+		SrcPort: layers.UDPPort(srcPort),
 		DstPort: layers.UDPPort(st.cfg.UDPPort),
 	}
 	if err := udpLayer.SetNetworkLayerForChecksum(ipLayer); err != nil {

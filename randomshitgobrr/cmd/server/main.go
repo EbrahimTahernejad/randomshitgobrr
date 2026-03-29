@@ -28,6 +28,7 @@ import (
 	"log"
 	"net"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
@@ -233,9 +234,10 @@ func main() {
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen for DNS queries (required)")
 	flag.StringVar(&destIPStr, "dest-ip", "", "client's public IPv4 address to send downstream traffic to (required)")
 	flag.StringVar(&spoofSrcStr, "spoof-src", "", "spoofed source IP for downstream ICMP/UDP (leave empty for normal send)")
-	var udpPort, udpSrcPort int
+	var udpPort int
+	var udpSrcPortStr string
 	flag.IntVar(&udpPort, "downstream-udp-port", 0, "use UDP downstream instead of ICMP; client listens on this port (must match client, 0=ICMP)")
-	flag.IntVar(&udpSrcPort, "downstream-udp-src-port", defCfg.UDPSrcPort, "source port for spoofed downstream UDP packets (e.g. 53 looks like DNS response)")
+	flag.StringVar(&udpSrcPortStr, "downstream-udp-src-port", fmt.Sprint(defCfg.UDPSrcPort), "source port for spoofed downstream UDP (number or \"random\")")
 	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "bytes used as DNS/ICMP session ID (must match client)")
 	flag.IntVar(&icmpID, "icmp-id", defCfg.IcmpID, "ICMP Echo identifier for tunnel packets (must match client)")
 	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match client)")
@@ -319,6 +321,14 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
+	}
+	var udpSrcPort int // 0 = random
+	if udpSrcPortStr != "random" {
+		udpSrcPort, err = strconv.Atoi(udpSrcPortStr)
+		if err != nil || udpSrcPort < 1 || udpSrcPort > 65535 {
+			fmt.Fprintf(os.Stderr, "-downstream-udp-src-port: expected 1-65535 or \"random\", got %q\n", udpSrcPortStr)
+			os.Exit(1)
+		}
 	}
 	cfg := hybrid.Config{
 		ClientIDLen: clientIDLen,
