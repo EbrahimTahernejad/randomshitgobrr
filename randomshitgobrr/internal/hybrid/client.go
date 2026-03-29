@@ -42,6 +42,19 @@ type ClientConn struct {
 	resolvers   []net.Addr
 	resolverIdx int
 	broadcast   int // number of resolvers to send each packet to; 1 = round-robin
+	transport   net.PacketConn
+	recvCloser  io.Closer // icmpConn or udpConn — closed by Close()
+}
+
+// Close shuts down the ClientConn and stops all background goroutines.
+func (c *ClientConn) Close() error {
+	if c.recvCloser != nil {
+		c.recvCloser.Close()
+	}
+	if c.transport != nil {
+		c.transport.Close()
+	}
+	return c.QueuePacketConn.Close()
 }
 
 // NewClientConn creates a ClientConn and starts its background goroutines.
@@ -67,9 +80,12 @@ func NewClientConn(transport net.PacketConn, resolvers []net.Addr, broadcast int
 		pollChan:        make(chan struct{}, pollLimit),
 		resolvers:       resolvers,
 		broadcast:       broadcast,
+		transport:       transport,
 	}
-	log.Printf("hybrid: clientID=%s icmpID=%#x maxLabelLen=%d recordType=%d mtu=%d resolvers=%d broadcast=%d",
-		clientID, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType, cfg.MaxKCPMTU(), len(resolvers), broadcast)
+	if cfg.Verbose {
+		log.Printf("hybrid: clientID=%s icmpID=%#x maxLabelLen=%d recordType=%d mtu=%d resolvers=%d broadcast=%d",
+			clientID, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType, cfg.MaxKCPMTU(), len(resolvers), broadcast)
+	}
 
 	// Drain DNS responses — downstream data arrives via ICMP or UDP instead.
 	go func() {
@@ -86,9 +102,9 @@ func NewClientConn(transport net.PacketConn, resolvers []net.Addr, broadcast int
 		if err != nil {
 			return nil, fmt.Errorf("listen UDP port %d: %w", cfg.UDPPort, err)
 		}
+		c.recvCloser = udpConn
 		go func() {
-			defer udpConn.Close()
-			if err := c.udpRecvLoop(udpConn); err != nil {
+			if err := c.udpRecvLoop(udpConn); err != nil && err.Error() != "use of closed network connection" {
 				log.Printf("udpRecvLoop: %v", err)
 			}
 		}()
@@ -97,8 +113,8 @@ func NewClientConn(transport net.PacketConn, resolvers []net.Addr, broadcast int
 		if err != nil {
 			return nil, fmt.Errorf("listen ICMP (requires root/CAP_NET_RAW): %w", err)
 		}
+		c.recvCloser = icmpConn
 		go func() {
-			defer icmpConn.Close()
 			if err := c.icmpRecvLoop(icmpConn); err != nil {
 				log.Printf("icmpRecvLoop: %v", err)
 			}
@@ -121,7 +137,9 @@ func (c *ClientConn) ClientID() turbotunnel.ClientID { return c.clientID }
 // client ID prefix in the payload, then unpacks bundled KCP packets
 // and queues them for KCP to read.
 func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
-	log.Printf("icmpRecvLoop: started (filtering icmpID=%#x clientID=%s)", c.cfg.IcmpID, c.clientID)
+	if c.cfg.Verbose {
+		log.Printf("icmpRecvLoop: started (filtering icmpID=%#x clientID=%s)", c.cfg.IcmpID, c.clientID)
+	}
 	buf := make([]byte, 65536)
 	for {
 		n, _, src, err := conn.IPv4PacketConn().ReadFrom(buf)
@@ -192,7 +210,9 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 // The payload format is identical to ICMP: [clientID:N][uint16-len][data]...
 // No raw socket needed — the OS strips IP/UDP headers before delivery.
 func (c *ClientConn) udpRecvLoop(conn *net.UDPConn) error {
-	log.Printf("udpRecvLoop: started (port=%d clientID=%s)", c.cfg.UDPPort, c.clientID)
+	if c.cfg.Verbose {
+		log.Printf("udpRecvLoop: started (port=%d clientID=%s)", c.cfg.UDPPort, c.clientID)
+	}
 	buf := make([]byte, 65536)
 	idBytes := c.clientID.Bytes()
 	for {
