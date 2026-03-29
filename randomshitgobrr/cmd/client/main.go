@@ -71,13 +71,13 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	return nil
 }
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, resolvers []net.Addr, transport net.PacketConn, cfg hybrid.Config) error {
+func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, resolvers []net.Addr, broadcast int, transport net.PacketConn, cfg hybrid.Config) error {
 	defer transport.Close()
 
 	mtu := cfg.MaxKCPMTU()
 	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d recordType=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType)
 
-	pconn, err := hybrid.NewClientConn(transport, resolvers, domain, cfg)
+	pconn, err := hybrid.NewClientConn(transport, resolvers, broadcast, domain, cfg)
 	if err != nil {
 		return fmt.Errorf("hybrid conn: %v", err)
 	}
@@ -164,6 +164,7 @@ func main() {
 	var udpAddrs multiFlag
 	var pubkeyFile, pubkeyHex string
 	var verbose bool
+	var broadcast int
 
 	defCfg := hybrid.DefaultConfig()
 	var clientIDLen, icmpID, maxLabelLen int
@@ -178,6 +179,7 @@ func main() {
 	var recordTypeStr string
 	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS query type: txt, cname, a, aaaa, mx, ns, srv (must match server)")
 	flag.BoolVar(&verbose, "verbose", false, "enable per-packet diagnostic logging")
+	flag.IntVar(&broadcast, "broadcast", 1, "resolvers to send each packet to (1 = round-robin, >1 = redundant sends)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [-udp ADDR [-udp ADDR ...]|-doh URL|-dot ADDR] -pubkey-file FILE DOMAIN LOCALADDR\n\n", os.Args[0])
 		flag.PrintDefaults()
@@ -271,7 +273,7 @@ func main() {
 		RecordType:  recordType,
 		Verbose:     verbose,
 	}
-	if err := run(pubkey, domain, localAddr, resolvers, transport, cfg); err != nil {
+	if err := run(pubkey, domain, localAddr, resolvers, broadcast, transport, cfg); err != nil {
 		log.Fatal(err)
 	}
 }

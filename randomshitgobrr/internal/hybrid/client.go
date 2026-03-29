@@ -41,15 +41,23 @@ type ClientConn struct {
 	pollChan    chan struct{}
 	resolvers   []net.Addr
 	resolverIdx int
+	broadcast   int // number of resolvers to send each packet to; 1 = round-robin
 }
 
 // NewClientConn creates a ClientConn and starts its background goroutines.
 // transport carries the actual DNS messages (UDP socket, DoH, DoT).
 // resolvers is the list of DNS resolver addresses; queries are sent round-robin.
+// broadcast controls how many resolvers each packet is sent to (1 = round-robin only).
 // domain is the tunnel domain, e.g. t.example.com.
 // cfg controls wire-protocol parameters; use DefaultConfig() for normal operation.
 // Requires root or CAP_NET_RAW for raw ICMP reception.
-func NewClientConn(transport net.PacketConn, resolvers []net.Addr, domain dns.Name, cfg Config) (*ClientConn, error) {
+func NewClientConn(transport net.PacketConn, resolvers []net.Addr, broadcast int, domain dns.Name, cfg Config) (*ClientConn, error) {
+	if broadcast < 1 {
+		broadcast = 1
+	}
+	if broadcast > len(resolvers) {
+		broadcast = len(resolvers)
+	}
 	clientID := turbotunnel.NewClientID(cfg.ClientIDLen)
 	c := &ClientConn{
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
@@ -58,9 +66,10 @@ func NewClientConn(transport net.PacketConn, resolvers []net.Addr, domain dns.Na
 		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
 		resolvers:       resolvers,
+		broadcast:       broadcast,
 	}
-	log.Printf("hybrid: clientID=%s icmpID=%#x maxLabelLen=%d recordType=%d mtu=%d resolvers=%d",
-		clientID, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType, cfg.MaxKCPMTU(), len(resolvers))
+	log.Printf("hybrid: clientID=%s icmpID=%#x maxLabelLen=%d recordType=%d mtu=%d resolvers=%d broadcast=%d",
+		clientID, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType, cfg.MaxKCPMTU(), len(resolvers), broadcast)
 
 	icmpConn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
@@ -211,10 +220,12 @@ func (c *ClientConn) dnsSendLoop(transport net.PacketConn) error {
 		}
 		pollTimer.Reset(pollDelay)
 
-		addr := c.resolvers[c.resolverIdx]
-		c.resolverIdx = (c.resolverIdx + 1) % len(c.resolvers)
-		if err := c.sendDNS(transport, p, addr); err != nil {
-			log.Printf("sendDNS: %v", err)
+		for i := 0; i < c.broadcast; i++ {
+			addr := c.resolvers[c.resolverIdx]
+			c.resolverIdx = (c.resolverIdx + 1) % len(c.resolvers)
+			if err := c.sendDNS(transport, p, addr); err != nil {
+				log.Printf("sendDNS: %v", err)
+			}
 		}
 	}
 }
