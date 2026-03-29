@@ -71,13 +71,13 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	return nil
 }
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.Addr, transport net.PacketConn, cfg hybrid.Config) error {
+func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, resolvers []net.Addr, transport net.PacketConn, cfg hybrid.Config) error {
 	defer transport.Close()
 
 	mtu := cfg.MaxKCPMTU()
 	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d recordType=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType)
 
-	pconn, err := hybrid.NewClientConn(transport, remoteAddr, domain, cfg)
+	pconn, err := hybrid.NewClientConn(transport, resolvers, domain, cfg)
 	if err != nil {
 		return fmt.Errorf("hybrid conn: %v", err)
 	}
@@ -145,8 +145,23 @@ func readKey(filename string) ([]byte, error) {
 	return noise.ReadKey(f)
 }
 
+// multiFlag is a repeatable string flag (e.g. -udp 8.8.8.8:53 -udp 1.1.1.1:53).
+type multiFlag []string
+
+func (f *multiFlag) String() string {
+	if f == nil || len(*f) == 0 {
+		return ""
+	}
+	return (*f)[0]
+}
+func (f *multiFlag) Set(v string) error {
+	*f = append(*f, v)
+	return nil
+}
+
 func main() {
-	var dohURL, dotAddr, udpAddr string
+	var dohURL, dotAddr string
+	var udpAddrs multiFlag
 	var pubkeyFile, pubkeyHex string
 	var verbose bool
 
@@ -154,7 +169,7 @@ func main() {
 	var clientIDLen, icmpID, maxLabelLen int
 	flag.StringVar(&dohURL, "doh", "", "DNS-over-HTTPS resolver URL")
 	flag.StringVar(&dotAddr, "dot", "", "DNS-over-TLS resolver address")
-	flag.StringVar(&udpAddr, "udp", "", "UDP DNS resolver address")
+	flag.Var(&udpAddrs, "udp", "UDP DNS resolver address (repeatable for round-robin)")
 	flag.StringVar(&pubkeyFile, "pubkey-file", "", "server public key file")
 	flag.StringVar(&pubkeyHex, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
 	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "bytes used as DNS/ICMP session ID (must match server)")
@@ -164,7 +179,7 @@ func main() {
 	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS query type: txt, cname, a, aaaa, mx, ns, srv (must match server)")
 	flag.BoolVar(&verbose, "verbose", false, "enable per-packet diagnostic logging")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-udp ADDR|-doh URL|-dot ADDR] -pubkey-file FILE DOMAIN LOCALADDR\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "Usage: %s [-udp ADDR [-udp ADDR ...]|-doh URL|-dot ADDR] -pubkey-file FILE DOMAIN LOCALADDR\n\n", os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -203,28 +218,31 @@ func main() {
 		os.Exit(1)
 	}
 
-	var remoteAddr net.Addr
+	var resolvers []net.Addr
 	var transport net.PacketConn
 	n := 0
 
 	if dohURL != "" {
 		n++
-		remoteAddr = turbotunnel.DummyAddr{}
+		resolvers = []net.Addr{turbotunnel.DummyAddr{}}
 		rt := http.DefaultTransport.(*http.Transport).Clone()
 		rt.Proxy = nil
 		transport = newDOHConn(rt, dohURL)
 	}
 	if dotAddr != "" {
 		n++
-		remoteAddr = turbotunnel.DummyAddr{}
+		resolvers = []net.Addr{turbotunnel.DummyAddr{}}
 		transport = newDOTConn(dotAddr)
 	}
-	if udpAddr != "" {
+	if len(udpAddrs) > 0 {
 		n++
-		remoteAddr, err = net.ResolveUDPAddr("udp", udpAddr)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
+		for _, s := range udpAddrs {
+			addr, resolveErr := net.ResolveUDPAddr("udp", s)
+			if resolveErr != nil {
+				fmt.Fprintln(os.Stderr, resolveErr)
+				os.Exit(1)
+			}
+			resolvers = append(resolvers, addr)
 		}
 		transport, err = net.ListenUDP("udp", nil)
 		if err != nil {
@@ -253,7 +271,7 @@ func main() {
 		RecordType:  recordType,
 		Verbose:     verbose,
 	}
-	if err := run(pubkey, domain, localAddr, remoteAddr, transport, cfg); err != nil {
+	if err := run(pubkey, domain, localAddr, resolvers, transport, cfg); err != nil {
 		log.Fatal(err)
 	}
 }

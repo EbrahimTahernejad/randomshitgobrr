@@ -35,19 +35,21 @@ var base32Enc = base32.StdEncoding.WithPadding(base32.NoPadding)
 // reads come from raw ICMP Echo Requests sent by the server.
 type ClientConn struct {
 	*turbotunnel.QueuePacketConn
-	cfg      Config
-	clientID turbotunnel.ClientID // cfg.ClientIDLen bytes; used on wire and as turbotunnel identity
-	domain   dns.Name
-	pollChan chan struct{}
+	cfg         Config
+	clientID    turbotunnel.ClientID // cfg.ClientIDLen bytes; used on wire and as turbotunnel identity
+	domain      dns.Name
+	pollChan    chan struct{}
+	resolvers   []net.Addr
+	resolverIdx int
 }
 
 // NewClientConn creates a ClientConn and starts its background goroutines.
 // transport carries the actual DNS messages (UDP socket, DoH, DoT).
-// addr is the DNS resolver address.
+// resolvers is the list of DNS resolver addresses; queries are sent round-robin.
 // domain is the tunnel domain, e.g. t.example.com.
 // cfg controls wire-protocol parameters; use DefaultConfig() for normal operation.
 // Requires root or CAP_NET_RAW for raw ICMP reception.
-func NewClientConn(transport net.PacketConn, addr net.Addr, domain dns.Name, cfg Config) (*ClientConn, error) {
+func NewClientConn(transport net.PacketConn, resolvers []net.Addr, domain dns.Name, cfg Config) (*ClientConn, error) {
 	clientID := turbotunnel.NewClientID(cfg.ClientIDLen)
 	c := &ClientConn{
 		QueuePacketConn: turbotunnel.NewQueuePacketConn(clientID, 0),
@@ -55,9 +57,10 @@ func NewClientConn(transport net.PacketConn, addr net.Addr, domain dns.Name, cfg
 		clientID:        clientID,
 		domain:          domain,
 		pollChan:        make(chan struct{}, pollLimit),
+		resolvers:       resolvers,
 	}
-	log.Printf("hybrid: clientID=%s icmpID=%#x maxLabelLen=%d recordType=%d mtu=%d",
-		clientID, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType, cfg.MaxKCPMTU())
+	log.Printf("hybrid: clientID=%s icmpID=%#x maxLabelLen=%d recordType=%d mtu=%d resolvers=%d",
+		clientID, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType, cfg.MaxKCPMTU(), len(resolvers))
 
 	icmpConn, err := icmp.ListenPacket("ip4:icmp", "0.0.0.0")
 	if err != nil {
@@ -82,7 +85,7 @@ func NewClientConn(transport net.PacketConn, addr net.Addr, domain dns.Name, cfg
 	}()
 
 	go func() {
-		if err := c.dnsSendLoop(transport, addr); err != nil {
+		if err := c.dnsSendLoop(transport); err != nil {
 			log.Printf("dnsSendLoop: %v", err)
 		}
 	}()
@@ -164,8 +167,9 @@ func (c *ClientConn) icmpRecvLoop(conn *icmp.PacketConn) error {
 }
 
 // dnsSendLoop reads outgoing KCP packets and sends each as a DNS TXT query,
-// also sending empty polling queries on a timer.
-func (c *ClientConn) dnsSendLoop(transport net.PacketConn, addr net.Addr) error {
+// also sending empty polling queries on a timer. Queries are sent round-robin
+// across all configured resolvers.
+func (c *ClientConn) dnsSendLoop(transport net.PacketConn) error {
 	pollDelay := initPollDelay
 	pollTimer := time.NewTimer(pollDelay)
 	for {
@@ -207,6 +211,8 @@ func (c *ClientConn) dnsSendLoop(transport net.PacketConn, addr net.Addr) error 
 		}
 		pollTimer.Reset(pollDelay)
 
+		addr := c.resolvers[c.resolverIdx]
+		c.resolverIdx = (c.resolverIdx + 1) % len(c.resolvers)
 		if err := c.sendDNS(transport, p, addr); err != nil {
 			log.Printf("sendDNS: %v", err)
 		}
