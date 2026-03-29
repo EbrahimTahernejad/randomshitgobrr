@@ -230,11 +230,11 @@ hybrid-scanner \
 | `-timeout` | `10s` | Per-IP timeout (DNS checks and handshake) |
 | `-dns-port` | `53` | DNS port on scanned IPs |
 | `-output` | `results.csv` | Output file |
-| `-verbose` | `false` | Log every DNS probe attempt, not just results |
-
 Output format: `ip,latency_ms`
 
 Requires root/`CAP_NET_RAW` (opens a raw ICMP socket per handshake worker).
+
+The scanner has a live terminal UI showing stage progress bars, pass/fail counters, a scrolling results feed, and elapsed time.
 
 ---
 

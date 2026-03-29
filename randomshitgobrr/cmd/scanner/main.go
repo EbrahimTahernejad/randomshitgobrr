@@ -1,15 +1,12 @@
-// hybrid-scanner probes a list of IPs/CIDRs to find ones that work as DNS
-// relays for the hybrid tunnel. Three stages run as a pipeline:
+// hybrid-scanner probes IPs/CIDRs to find working DNS relays for the tunnel.
 //
-//   - Stage 1 (sampler): reads IPs/CIDRs from a file, reservoir-samples N of
-//     them, and feeds them into the DNS stage as fast as it consumes.
-//   - Stage 2 (DNS workers): concurrently check NS and A queries against each
-//     IP; those that answer both are forwarded to the handshake stage.
-//   - Stage 3 (handshake workers): time a full Noise handshake through each
-//     qualifying IP as a DNS relay; results are written to the output CSV.
+// Pipeline:
 //
-// Stages 2 and 3 run simultaneously — while handshake workers are blocked
-// waiting for KCP round-trips, DNS workers keep qualifying new IPs.
+//	Stage 1  sampler    → reads list, reservoir-samples N IPs
+//	Stage 2  DNS check  → NS+A queries in parallel (fast, many workers)
+//	Stage 3  Handshake  → full Noise handshake timing (slower, fewer workers)
+//
+// Stages 2 and 3 run simultaneously via a channel between them.
 //
 // Usage:
 //
@@ -18,23 +15,16 @@
 package main
 
 import (
-	"bufio"
-	"encoding/binary"
 	"flag"
 	"fmt"
 	"log"
-	"math/rand"
-	"net"
 	"os"
-	"strings"
-	"sync"
 	"time"
 
-	"github.com/user/randomshitgobrr/internal/hybrid"
-	"github.com/xtaci/kcp-go/v5"
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/net2share/vaydns/dns"
 	"github.com/net2share/vaydns/noise"
-	"github.com/net2share/vaydns/turbotunnel"
+	"github.com/user/randomshitgobrr/internal/hybrid"
 )
 
 func main() {
@@ -43,7 +33,6 @@ func main() {
 	var nsDomainStr, aDomainStr, tunnelDomainStr string
 	var pubkeyFile, pubkeyHex string
 	var timeout time.Duration
-	var verbose bool
 
 	defCfg := hybrid.DefaultConfig()
 	var clientIDLen, icmpID, maxLabelLen int
@@ -59,19 +48,19 @@ func main() {
 	flag.StringVar(&outputFile, "output", "results.csv", "output file (CSV: ip,latency_ms)")
 	flag.IntVar(&dnsWorkers, "dns-workers", 200, "concurrent NS+A check workers (stage 2)")
 	flag.IntVar(&hsWorkers, "hs-workers", 50, "concurrent Noise handshake workers (stage 3)")
-	flag.DurationVar(&timeout, "timeout", 10*time.Second, "per-IP timeout (DNS checks and handshake)")
+	flag.DurationVar(&timeout, "timeout", 10*time.Second, "per-IP timeout")
 	flag.IntVar(&dnsPort, "dns-port", 53, "DNS port on scanned IPs")
 	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "session ID length (must match server)")
 	flag.IntVar(&icmpID, "icmp-id", defCfg.IcmpID, "ICMP Echo identifier (must match server)")
 	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match server)")
 	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS query type (must match server)")
-	flag.BoolVar(&verbose, "verbose", false, "log every DNS probe attempt (not just successes)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s -list FILE -sample N -ns DOMAIN -a DOMAIN -domain DOMAIN -pubkey-file FILE [flags]\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr,
+			"Usage: %s -list FILE -sample N -ns DOMAIN -a DOMAIN -domain DOMAIN -pubkey-file FILE [flags]\n\n",
+			os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
-	log.SetFlags(log.LstdFlags | log.LUTC)
 
 	if listFile == "" || nsDomainStr == "" || aDomainStr == "" || tunnelDomainStr == "" {
 		flag.Usage()
@@ -120,19 +109,15 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	cfg := hybrid.Config{
-		ClientIDLen: clientIDLen,
-		IcmpID:      icmpID,
-		MaxLabelLen: maxLabelLen,
-		RecordType:  recordType,
-		// Verbose intentionally false — scanner logs its own results
-	}
 
-	ips, err := loadAndSample(listFile, sampleCount)
+	// Load IPs before starting the TUI so warnings can be printed cleanly.
+	ips, warnings, err := loadAndSample(listFile, sampleCount)
 	if err != nil {
 		log.Fatalf("load list: %v", err)
 	}
-	log.Printf("sampled %d IPs — dns-workers=%d hs-workers=%d", len(ips), dnsWorkers, hsWorkers)
+	for _, w := range warnings {
+		fmt.Fprintln(os.Stderr, "warn:", w)
+	}
 
 	out, err := os.Create(outputFile)
 	if err != nil {
@@ -141,259 +126,32 @@ func main() {
 	defer out.Close()
 	fmt.Fprintln(out, "ip,latency_ms")
 
-	var mu sync.Mutex
-	dnsPassed, dnsFailed, hsPassed, hsFailed := 0, 0, 0, 0
-
-	// Stage 1 → Stage 2 channel.
-	ipChan := make(chan net.IP, dnsWorkers)
-	// Stage 2 → Stage 3 channel.
-	qualifiedChan := make(chan net.IP, hsWorkers)
-
-	// Stage 1: feed sampled IPs into the DNS stage.
-	go func() {
-		for _, ip := range ips {
-			ipChan <- ip
-		}
-		close(ipChan)
-	}()
-
-	// Stage 2: DNS workers — NS+A checks, qualified IPs forwarded to Stage 3.
-	var dnsWG sync.WaitGroup
-	for i := 0; i < dnsWorkers; i++ {
-		dnsWG.Add(1)
-		go func() {
-			defer dnsWG.Done()
-			for ip := range ipChan {
-				ipStr := ip.String()
-				ok, reason := dnsCheck2(ipStr, dnsPort, nsDomain, aDomain, timeout)
-				mu.Lock()
-				if ok {
-					dnsPassed++
-					if verbose {
-						log.Printf("%-15s  DNS OK", ipStr)
-					}
-				} else {
-					dnsFailed++
-					if verbose {
-						log.Printf("%-15s  DNS FAIL  %s", ipStr, reason)
-					}
-				}
-				mu.Unlock()
-				if ok {
-					qualifiedChan <- ip
-				}
-			}
-		}()
-	}
-	// Close qualifiedChan once all DNS workers finish.
-	go func() {
-		dnsWG.Wait()
-		close(qualifiedChan)
-	}()
-
-	// Stage 3: handshake workers — Noise handshake timing.
-	var hsWG sync.WaitGroup
-	for i := 0; i < hsWorkers; i++ {
-		hsWG.Add(1)
-		go func() {
-			defer hsWG.Done()
-			for ip := range qualifiedChan {
-				lat, err := doHandshake(ip, dnsPort, tunnelDomain, pubkey, cfg, timeout)
-				mu.Lock()
-				if err != nil {
-					hsFailed++
-					log.Printf("%-15s  HS FAIL  %v", ip, err)
-				} else {
-					hsPassed++
-					log.Printf("%-15s  HS OK    %.0f ms", ip, float64(lat.Milliseconds()))
-					fmt.Fprintf(out, "%s,%.2f\n", ip, float64(lat.Milliseconds()))
-				}
-				mu.Unlock()
-			}
-		}()
-	}
-	hsWG.Wait()
-
-	log.Printf("done: dns %d/%d passed  handshake %d/%d passed → %s",
-		dnsPassed, dnsPassed+dnsFailed, hsPassed, hsPassed+hsFailed, outputFile)
-}
-
-// dnsCheck2 checks both NS and A queries. Returns (true, "") on success or
-// (false, reason) on failure.
-func dnsCheck2(ipStr string, dnsPort int, nsDomain, aDomain dns.Name, timeout time.Duration) (bool, string) {
-	if !dnsCheck(ipStr, dnsPort, nsDomain, hybrid.RRTypeNS, timeout) {
-		return false, "NS no answer"
-	}
-	if !dnsCheck(ipStr, dnsPort, aDomain, hybrid.RRTypeA, timeout) {
-		return false, "A no answer"
-	}
-	return true, ""
-}
-
-// doHandshake opens a hybrid ClientConn through ip as the DNS relay and times
-// the Noise NK handshake with the server.
-func doHandshake(ip net.IP, dnsPort int, tunnelDomain dns.Name, pubkey []byte, cfg hybrid.Config, timeout time.Duration) (time.Duration, error) {
-	resolver, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip.String(), fmt.Sprint(dnsPort)))
-	if err != nil {
-		return 0, err
-	}
-	transport, err := net.ListenUDP("udp", nil)
-	if err != nil {
-		return 0, err
+	cfg := hybrid.Config{
+		ClientIDLen: clientIDLen,
+		IcmpID:      icmpID,
+		MaxLabelLen: maxLabelLen,
+		RecordType:  recordType,
+		// Verbose false — scanner has its own UI
 	}
 
-	pconn, err := hybrid.NewClientConn(transport, []net.Addr{resolver}, 1, tunnelDomain, cfg)
-	if err != nil {
-		transport.Close()
-		return 0, fmt.Errorf("client conn: %w", err)
-	}
-	defer pconn.Close()
-
-	kcpConn, err := kcp.NewConn2(turbotunnel.DummyAddr{}, nil, 0, 0, pconn)
-	if err != nil {
-		return 0, err
-	}
-	defer kcpConn.Close()
-
-	kcpConn.SetStreamMode(true)
-	kcpConn.SetNoDelay(1, 20, 2, 1)
-	kcpConn.SetWindowSize(128, 128)
-	kcpConn.SetMtu(cfg.MaxKCPMTU())
-	kcpConn.SetDeadline(time.Now().Add(timeout))
-
-	start := time.Now()
-	_, err = noise.NewClient(kcpConn, pubkey)
-	if err != nil {
-		return 0, fmt.Errorf("handshake: %w", err)
-	}
-	return time.Since(start), nil
-}
-
-// dnsCheck sends a single DNS query and returns true if the response is
-// NOERROR with at least one answer.
-func dnsCheck(resolverIP string, dnsPort int, name dns.Name, qtype uint16, timeout time.Duration) bool {
-	conn, err := net.DialTimeout("udp", net.JoinHostPort(resolverIP, fmt.Sprint(dnsPort)), timeout)
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(timeout))
-
-	var id uint16
-	binary.Read(rand.New(rand.NewSource(rand.Int63())), binary.BigEndian, &id)
-	query := &dns.Message{
-		ID:    id,
-		Flags: 0x0100,
-		Question: []dns.Question{
-			{Name: name, Type: qtype, Class: dns.ClassIN},
-		},
-	}
-	buf, err := query.WireFormat()
-	if err != nil {
-		return false
-	}
-	if _, err := conn.Write(buf); err != nil {
-		return false
-	}
-	resp := make([]byte, 4096)
-	n, err := conn.Read(resp)
-	if err != nil {
-		return false
-	}
-	msg, err := dns.MessageFromWireFormat(resp[:n])
-	if err != nil {
-		return false
-	}
-	return msg.Rcode() == dns.RcodeNoError && len(msg.Answer) > 0
-}
-
-// loadAndSample reads IPs and CIDR ranges from filename and reservoir-samples
-// up to n of them. Memory usage is O(n) regardless of list size.
-func loadAndSample(filename string, n int) ([]net.IP, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-
-	reservoir := make([]net.IP, 0, n)
-	total := 0
-
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-
-		var batch []net.IP
-		if strings.Contains(line, "/") {
-			batch, err = expandCIDR(line)
-			if err != nil {
-				log.Printf("skip %q: %v", line, err)
-				continue
-			}
-		} else {
-			ip := net.ParseIP(line)
-			if ip == nil {
-				log.Printf("skip invalid IP %q", line)
-				continue
-			}
-			if ip4 := ip.To4(); ip4 != nil {
-				batch = []net.IP{ip4}
-			}
-		}
-
-		for _, ip := range batch {
-			if total < n {
-				reservoir = append(reservoir, ip)
-			} else {
-				j := rand.Intn(total + 1)
-				if j < n {
-					reservoir[j] = ip
-				}
-			}
-			total++
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return nil, err
-	}
-	if len(reservoir) == 0 {
-		return nil, fmt.Errorf("no valid IPs found in %s", filename)
+	stats := &scanStats{}
+	uiCfg := uiConfig{
+		total:      len(ips),
+		listFile:   listFile,
+		domain:     tunnelDomainStr,
+		dnsWorkers: dnsWorkers,
+		hsWorkers:  hsWorkers,
+		outputFile: outputFile,
+		start:      time.Now(),
 	}
 
-	rand.Shuffle(len(reservoir), func(i, j int) {
-		reservoir[i], reservoir[j] = reservoir[j], reservoir[i]
-	})
-	return reservoir, nil
-}
+	// Start the scanner pipeline in the background.
+	go runScanner(ips, dnsPort, nsDomain, aDomain, tunnelDomain, pubkey, cfg,
+		dnsWorkers, hsWorkers, timeout, out, stats)
 
-func expandCIDR(cidr string) ([]net.IP, error) {
-	_, ipNet, err := net.ParseCIDR(cidr)
-	if err != nil {
-		return nil, err
-	}
-	var ips []net.IP
-	ip := cloneIP(ipNet.IP.To4())
-	for ipNet.Contains(ip) {
-		ips = append(ips, cloneIP(ip))
-		incrementIP(ip)
-	}
-	return ips, nil
-}
-
-func cloneIP(ip net.IP) net.IP {
-	c := make(net.IP, len(ip))
-	copy(c, ip)
-	return c
-}
-
-func incrementIP(ip net.IP) {
-	for i := len(ip) - 1; i >= 0; i-- {
-		ip[i]++
-		if ip[i] != 0 {
-			break
-		}
+	// Run the TUI (blocks until done or q).
+	p := tea.NewProgram(newModel(uiCfg, stats), tea.WithAltScreen())
+	if _, err := p.Run(); err != nil {
+		log.Fatal(err)
 	}
 }
