@@ -166,7 +166,7 @@ func (c *ClientConn) dnsSendLoop(transport net.PacketConn, addr net.Addr) error 
 	pollTimer := time.NewTimer(pollDelay)
 	for {
 		var p []byte
-		outgoing := c.QueuePacketConn.OutgoingQueue(addr)
+		outgoing := c.QueuePacketConn.OutgoingQueue(turbotunnel.DummyAddr{})
 		pollTimerExpired := false
 
 		select {

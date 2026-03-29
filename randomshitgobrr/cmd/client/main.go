@@ -82,7 +82,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, remoteAddr net.
 		return fmt.Errorf("hybrid conn: %v", err)
 	}
 
-	conn, err := kcp.NewConn2(remoteAddr, nil, 0, 0, pconn)
+	conn, err := kcp.NewConn2(turbotunnel.DummyAddr{}, nil, 0, 0, pconn)
 	if err != nil {
 		return fmt.Errorf("KCP conn: %v", err)
 	}
