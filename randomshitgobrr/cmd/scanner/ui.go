@@ -109,8 +109,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 		if isDone {
 			if m.done {
+				if m.final {
+					return m, tea.Quit
+				}
+				// Linger one second on the final frame before handing back to shell.
 				m.final = true
-				return m, tea.Quit
+				return m, tea.Tick(time.Second, func(time.Time) tea.Msg { return tickMsg{} })
 			}
 			m.done = true
 		}

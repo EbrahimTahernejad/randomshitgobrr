@@ -149,9 +149,17 @@ func main() {
 	go runScanner(ips, dnsPort, nsDomain, aDomain, tunnelDomain, pubkey, cfg,
 		dnsWorkers, hsWorkers, timeout, out, stats)
 
-	// Run the TUI (blocks until done or q).
-	p := tea.NewProgram(newModel(uiCfg, stats), tea.WithAltScreen())
+	// Run the TUI without alt screen so the final state stays in the scroll
+	// buffer when the program exits.
+	p := tea.NewProgram(newModel(uiCfg, stats))
 	if _, err := p.Run(); err != nil {
 		log.Fatal(err)
 	}
+
+	// Print a plain-text summary so it's always visible after the TUI.
+	fmt.Printf("\ndns  %d/%d passed    handshake  %d/%d passed    → %s\n",
+		stats.dnsPassed.Load(), stats.dnsDone.Load(),
+		stats.hsPassed.Load(), stats.hsDone.Load(),
+		outputFile,
+	)
 }
