@@ -187,13 +187,13 @@ The client accepts TCP connections on `LOCALADDR` and forwards them through the 
 
 ## Scanner
 
-`hybrid-scanner` finds working DNS resolvers for the tunnel by probing IPs from a list. For each sampled IP it:
+`hybrid-scanner` finds working DNS resolvers for the tunnel by probing IPs from a list. It runs as a three-stage pipeline:
 
-1. Sends an NS query — must return an answer
-2. Sends an A query — must return an answer
-3. Runs a full Noise handshake through the IP as a DNS relay and records the latency
+1. **Sampler** — reads IPs/CIDRs, reservoir-samples N, feeds into the DNS stage
+2. **DNS workers** — concurrently send NS and A queries to each IP; those that answer both are forwarded to the handshake stage
+3. **Handshake workers** — run a full Noise handshake through each qualifying IP as a DNS relay and record the latency
 
-Passing IPs are written to a CSV with their handshake time.
+Stages 2 and 3 run simultaneously — while handshake workers are blocked waiting for KCP round-trips, DNS workers keep qualifying new IPs in the background.
 
 ```bash
 hybrid-scanner \
@@ -203,7 +203,8 @@ hybrid-scanner \
   -a example.com \
   -domain t.example.com \
   -pubkey-file server.pub \
-  -workers 100 \
+  -dns-workers 200 \
+  -hs-workers 50 \
   -timeout 8s \
   -output results.csv
 ```
@@ -224,14 +225,16 @@ hybrid-scanner \
 | `-a` | — | Domain for A query check (required) |
 | `-domain` | — | Tunnel domain for handshake (required) |
 | `-pubkey-file` / `-pubkey` | — | Server public key |
-| `-workers` | `50` | Concurrent probes |
-| `-timeout` | `10s` | Per-IP timeout |
+| `-dns-workers` | `200` | Concurrent NS+A check workers (stage 2) |
+| `-hs-workers` | `50` | Concurrent Noise handshake workers (stage 3) |
+| `-timeout` | `10s` | Per-IP timeout (DNS checks and handshake) |
 | `-dns-port` | `53` | DNS port on scanned IPs |
 | `-output` | `results.csv` | Output file |
+| `-verbose` | `false` | Log every DNS probe attempt, not just results |
 
 Output format: `ip,latency_ms`
 
-Requires root/`CAP_NET_RAW` (opens a raw ICMP socket per worker for the handshake).
+Requires root/`CAP_NET_RAW` (opens a raw ICMP socket per handshake worker).
 
 ---
 

@@ -1,11 +1,15 @@
 // hybrid-scanner probes a list of IPs/CIDRs to find ones that work as DNS
-// relays for the hybrid tunnel. Two stages run in parallel:
+// relays for the hybrid tunnel. Three stages run as a pipeline:
 //
-//   - Stage 1: reads IPs/CIDRs from a file, samples N of them, feeds into a channel.
-//   - Stage 2: workers pull IPs from the channel, check NS+A DNS responses,
-//     then time a full Noise handshake through the IP as a resolver.
+//   - Stage 1 (sampler): reads IPs/CIDRs from a file, reservoir-samples N of
+//     them, and feeds them into the DNS stage as fast as it consumes.
+//   - Stage 2 (DNS workers): concurrently check NS and A queries against each
+//     IP; those that answer both are forwarded to the handshake stage.
+//   - Stage 3 (handshake workers): time a full Noise handshake through each
+//     qualifying IP as a DNS relay; results are written to the output CSV.
 //
-// IPs that pass both checks are written to the output file with their handshake latency.
+// Stages 2 and 3 run simultaneously — while handshake workers are blocked
+// waiting for KCP round-trips, DNS workers keep qualifying new IPs.
 //
 // Usage:
 //
@@ -35,7 +39,7 @@ import (
 
 func main() {
 	var listFile, outputFile string
-	var sampleCount, workers, dnsPort int
+	var sampleCount, dnsWorkers, hsWorkers, dnsPort int
 	var nsDomainStr, aDomainStr, tunnelDomainStr string
 	var pubkeyFile, pubkeyHex string
 	var timeout time.Duration
@@ -53,14 +57,15 @@ func main() {
 	flag.StringVar(&pubkeyFile, "pubkey-file", "", "server public key file")
 	flag.StringVar(&pubkeyHex, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
 	flag.StringVar(&outputFile, "output", "results.csv", "output file (CSV: ip,latency_ms)")
-	flag.IntVar(&workers, "workers", 50, "concurrent scan workers")
-	flag.DurationVar(&timeout, "timeout", 10*time.Second, "per-IP timeout for DNS checks and handshake")
+	flag.IntVar(&dnsWorkers, "dns-workers", 200, "concurrent NS+A check workers (stage 2)")
+	flag.IntVar(&hsWorkers, "hs-workers", 50, "concurrent Noise handshake workers (stage 3)")
+	flag.DurationVar(&timeout, "timeout", 10*time.Second, "per-IP timeout (DNS checks and handshake)")
 	flag.IntVar(&dnsPort, "dns-port", 53, "DNS port on scanned IPs")
 	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "session ID length (must match server)")
 	flag.IntVar(&icmpID, "icmp-id", defCfg.IcmpID, "ICMP Echo identifier (must match server)")
 	flag.IntVar(&maxLabelLen, "max-label-len", defCfg.MaxLabelLen, "max base32 chars per DNS label (must match server)")
 	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS query type (must match server)")
-	flag.BoolVar(&verbose, "verbose", false, "log every probe attempt")
+	flag.BoolVar(&verbose, "verbose", false, "log every DNS probe attempt (not just successes)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s -list FILE -sample N -ns DOMAIN -a DOMAIN -domain DOMAIN -pubkey-file FILE [flags]\n\n", os.Args[0])
 		flag.PrintDefaults()
@@ -127,7 +132,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("load list: %v", err)
 	}
-	log.Printf("sampled %d IPs", len(ips))
+	log.Printf("sampled %d IPs — dns-workers=%d hs-workers=%d", len(ips), dnsWorkers, hsWorkers)
 
 	out, err := os.Create(outputFile)
 	if err != nil {
@@ -137,10 +142,14 @@ func main() {
 	fmt.Fprintln(out, "ip,latency_ms")
 
 	var mu sync.Mutex
-	passed, failed := 0, 0
+	dnsPassed, dnsFailed, hsPassed, hsFailed := 0, 0, 0, 0
 
-	// Stage 1: feed sampled IPs into channel as fast as workers consume them.
-	ipChan := make(chan net.IP, workers)
+	// Stage 1 → Stage 2 channel.
+	ipChan := make(chan net.IP, dnsWorkers)
+	// Stage 2 → Stage 3 channel.
+	qualifiedChan := make(chan net.IP, hsWorkers)
+
+	// Stage 1: feed sampled IPs into the DNS stage.
 	go func() {
 		for _, ip := range ips {
 			ipChan <- ip
@@ -148,49 +157,83 @@ func main() {
 		close(ipChan)
 	}()
 
-	// Stage 2: workers probe each IP in parallel.
-	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
-		wg.Add(1)
+	// Stage 2: DNS workers — NS+A checks, qualified IPs forwarded to Stage 3.
+	var dnsWG sync.WaitGroup
+	for i := 0; i < dnsWorkers; i++ {
+		dnsWG.Add(1)
 		go func() {
-			defer wg.Done()
+			defer dnsWG.Done()
 			for ip := range ipChan {
-				lat, err := probeIP(ip, dnsPort, nsDomain, aDomain, tunnelDomain, pubkey, cfg, timeout)
+				ipStr := ip.String()
+				ok, reason := dnsCheck2(ipStr, dnsPort, nsDomain, aDomain, timeout)
 				mu.Lock()
-				if err != nil {
-					failed++
+				if ok {
+					dnsPassed++
 					if verbose {
-						log.Printf("%-15s  FAIL  %v", ip, err)
+						log.Printf("%-15s  DNS OK", ipStr)
 					}
 				} else {
-					passed++
-					log.Printf("%-15s  OK    %.0f ms", ip, float64(lat.Milliseconds()))
+					dnsFailed++
+					if verbose {
+						log.Printf("%-15s  DNS FAIL  %s", ipStr, reason)
+					}
+				}
+				mu.Unlock()
+				if ok {
+					qualifiedChan <- ip
+				}
+			}
+		}()
+	}
+	// Close qualifiedChan once all DNS workers finish.
+	go func() {
+		dnsWG.Wait()
+		close(qualifiedChan)
+	}()
+
+	// Stage 3: handshake workers — Noise handshake timing.
+	var hsWG sync.WaitGroup
+	for i := 0; i < hsWorkers; i++ {
+		hsWG.Add(1)
+		go func() {
+			defer hsWG.Done()
+			for ip := range qualifiedChan {
+				lat, err := doHandshake(ip, dnsPort, tunnelDomain, pubkey, cfg, timeout)
+				mu.Lock()
+				if err != nil {
+					hsFailed++
+					log.Printf("%-15s  HS FAIL  %v", ip, err)
+				} else {
+					hsPassed++
+					log.Printf("%-15s  HS OK    %.0f ms", ip, float64(lat.Milliseconds()))
 					fmt.Fprintf(out, "%s,%.2f\n", ip, float64(lat.Milliseconds()))
 				}
 				mu.Unlock()
 			}
 		}()
 	}
-	wg.Wait()
+	hsWG.Wait()
 
-	log.Printf("done: %d passed, %d failed → %s", passed, failed, outputFile)
+	log.Printf("done: dns %d/%d passed  handshake %d/%d passed → %s",
+		dnsPassed, dnsPassed+dnsFailed, hsPassed, hsPassed+hsFailed, outputFile)
 }
 
-// probeIP runs the full probe for one IP:
-//  1. NS query must return an answer.
-//  2. A query must return an answer.
-//  3. Noise handshake through the IP as DNS resolver — returns the handshake time.
-func probeIP(ip net.IP, dnsPort int, nsDomain, aDomain, tunnelDomain dns.Name, pubkey []byte, cfg hybrid.Config, timeout time.Duration) (time.Duration, error) {
-	ipStr := ip.String()
-
+// dnsCheck2 checks both NS and A queries. Returns (true, "") on success or
+// (false, reason) on failure.
+func dnsCheck2(ipStr string, dnsPort int, nsDomain, aDomain dns.Name, timeout time.Duration) (bool, string) {
 	if !dnsCheck(ipStr, dnsPort, nsDomain, hybrid.RRTypeNS, timeout) {
-		return 0, fmt.Errorf("NS query no answer")
+		return false, "NS no answer"
 	}
 	if !dnsCheck(ipStr, dnsPort, aDomain, hybrid.RRTypeA, timeout) {
-		return 0, fmt.Errorf("A query no answer")
+		return false, "A no answer"
 	}
+	return true, ""
+}
 
-	resolver, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ipStr, fmt.Sprint(dnsPort)))
+// doHandshake opens a hybrid ClientConn through ip as the DNS relay and times
+// the Noise NK handshake with the server.
+func doHandshake(ip net.IP, dnsPort int, tunnelDomain dns.Name, pubkey []byte, cfg hybrid.Config, timeout time.Duration) (time.Duration, error) {
+	resolver, err := net.ResolveUDPAddr("udp", net.JoinHostPort(ip.String(), fmt.Sprint(dnsPort)))
 	if err != nil {
 		return 0, err
 	}
@@ -226,8 +269,8 @@ func probeIP(ip net.IP, dnsPort int, nsDomain, aDomain, tunnelDomain dns.Name, p
 	return time.Since(start), nil
 }
 
-// dnsCheck sends a single DNS query to resolverIP:dnsPort and returns true if
-// the response is NOERROR with at least one answer.
+// dnsCheck sends a single DNS query and returns true if the response is
+// NOERROR with at least one answer.
 func dnsCheck(resolverIP string, dnsPort int, name dns.Name, qtype uint16, timeout time.Duration) bool {
 	conn, err := net.DialTimeout("udp", net.JoinHostPort(resolverIP, fmt.Sprint(dnsPort)), timeout)
 	if err != nil {
@@ -240,7 +283,7 @@ func dnsCheck(resolverIP string, dnsPort int, name dns.Name, qtype uint16, timeo
 	binary.Read(rand.New(rand.NewSource(rand.Int63())), binary.BigEndian, &id)
 	query := &dns.Message{
 		ID:    id,
-		Flags: 0x0100, // RD
+		Flags: 0x0100,
 		Question: []dns.Question{
 			{Name: name, Type: qtype, Class: dns.ClassIN},
 		},
