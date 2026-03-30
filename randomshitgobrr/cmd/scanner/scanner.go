@@ -11,8 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"golang.org/x/net/dns/dnsmessage"
-
+	mdns "github.com/miekg/dns"
 	"github.com/user/randomshitgobrr/internal/hybrid"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/net2share/vaydns/dns"
@@ -88,79 +87,85 @@ func runScanner(
 	stats.markDone()
 }
 
-// dnsCheckA sends a DNS A query to resolverIP:port using the standard
-// golang.org/x/net/dns/dnsmessage package (handles name compression correctly)
-// and returns true if the response is NOERROR with at least one A record.
+// dnsCheckA sends a DNS A query to resolverIP:port and returns true if the
+// response is NOERROR with at least one answer record.
 //
-// Uses an unconnected UDP socket (ListenUDP + WriteTo/ReadFrom) so that ICMP
-// port-unreachable messages from intermediate hops do NOT cause an immediate
-// ECONNREFUSED — a connected UDP socket would surface those errors instantly,
-// causing all checks to fail even for real resolvers behind lossy paths.
+// Strategy (mirrors findns):
+//  1. UDP with EDNS0 (1232-byte buffer)
+//  2. If FORMERR/SERVFAIL → retry UDP without EDNS0
+//  3. If TC bit set → retry over TCP
+//
+// The UDP path uses an unconnected socket (ListenUDP + WriteTo/ReadFrom) so
+// ICMP port-unreachable errors from intermediate hops are ignored rather than
+// surfaced immediately as ECONNREFUSED (connected UDP sockets propagate these).
 func dnsCheckA(resolverIP string, port int, name string, timeout time.Duration) bool {
-	dst, err := net.ResolveUDPAddr("udp", net.JoinHostPort(resolverIP, fmt.Sprint(port)))
+	addr := net.JoinHostPort(resolverIP, fmt.Sprint(port))
+	fqdn := mdns.Fqdn(name)
+
+	// 1. UDP with EDNS0
+	m := new(mdns.Msg)
+	m.SetQuestion(fqdn, mdns.TypeA)
+	m.RecursionDesired = true
+	m.SetEdns0(1232, false)
+
+	r := udpExchange(m, addr, timeout)
+
+	// 2. EDNS0 strip retry
+	if r != nil && (r.Rcode == mdns.RcodeFormatError || r.Rcode == mdns.RcodeServerFailure) {
+		m2 := new(mdns.Msg)
+		m2.SetQuestion(fqdn, mdns.TypeA)
+		m2.RecursionDesired = true
+		r = udpExchange(m2, addr, timeout)
+	}
+
+	// 3. TCP fallback if truncated
+	if r != nil && r.Truncated {
+		c := &mdns.Client{Net: "tcp", Timeout: timeout}
+		m2 := new(mdns.Msg)
+		m2.SetQuestion(fqdn, mdns.TypeA)
+		m2.RecursionDesired = true
+		if resp, _, err := c.Exchange(m2, addr); err == nil {
+			r = resp
+		}
+	}
+
+	return r != nil && r.Rcode == mdns.RcodeSuccess && len(r.Answer) > 0
+}
+
+// udpExchange sends a DNS message over an unconnected UDP socket and returns
+// the parsed response, or nil on error/timeout.
+func udpExchange(m *mdns.Msg, addr string, timeout time.Duration) *mdns.Msg {
+	packed, err := m.Pack()
 	if err != nil {
-		return false
+		return nil
+	}
+	dst, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		return nil
 	}
 	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
-		return false
+		return nil
 	}
 	defer conn.Close()
 	conn.SetDeadline(time.Now().Add(timeout)) //nolint:errcheck
 
-	fqdn := name
-	if !strings.HasSuffix(fqdn, ".") {
-		fqdn += "."
+	if _, err := conn.WriteTo(packed, dst); err != nil {
+		return nil
 	}
-	qname, err := dnsmessage.NewName(fqdn)
+	var buf [4096]byte
+	n, _, err := conn.ReadFrom(buf[:])
 	if err != nil {
-		return false
+		return nil
 	}
-
-	var buf [512]byte
-	b := dnsmessage.NewBuilder(buf[:0], dnsmessage.Header{
-		ID:               uint16(rand.Uint32()),
-		RecursionDesired: true,
-	})
-	b.StartQuestions() //nolint:errcheck
-	b.Question(dnsmessage.Question{ //nolint:errcheck
-		Name:  qname,
-		Type:  dnsmessage.TypeA,
-		Class: dnsmessage.ClassINET,
-	})
-	msg, err := b.Finish()
-	if err != nil {
-		return false
+	reply := new(mdns.Msg)
+	if err := reply.Unpack(buf[:n]); err != nil {
+		return nil
 	}
-
-	if _, err := conn.WriteTo(msg, dst); err != nil {
-		return false
+	if reply.Id != m.Id {
+		return nil // stray packet
 	}
-	var resp [4096]byte
-	n, _, err := conn.ReadFrom(resp[:])
-	if err != nil {
-		return false
-	}
-
-	var p dnsmessage.Parser
-	hdr, err := p.Start(resp[:n])
-	if err != nil {
-		return false
-	}
-	if hdr.RCode != dnsmessage.RCodeSuccess {
-		return false
-	}
-	p.SkipAllQuestions() //nolint:errcheck
-	for {
-		ah, err := p.AnswerHeader()
-		if err != nil {
-			return false // ErrSectionDone or parse error — no A record found
-		}
-		if ah.Type == dnsmessage.TypeA {
-			return true
-		}
-		p.SkipAnswer() //nolint:errcheck
-	}
+	return reply
 }
 
 // doHandshake opens a hybrid ClientConn through ip as DNS relay and times
