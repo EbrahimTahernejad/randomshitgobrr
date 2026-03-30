@@ -151,7 +151,7 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, resolvers []net
 }
 
 // runSocks is the SOCKS-uplink entry point.
-func runSocks(pubkey []byte, localAddr *net.TCPAddr, socksAddr, serverAddr string, cfg hybrid.Config) error {
+func runSocks(pubkey []byte, localAddr *net.TCPAddr, socksAddr, serverAddr string, mtu int, cfg hybrid.Config) error {
 	log.Printf("SOCKS uplink: connecting via %s to %s", socksAddr, serverAddr)
 
 	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
@@ -163,7 +163,6 @@ func runSocks(pubkey []byte, localAddr *net.TCPAddr, socksAddr, serverAddr strin
 		return fmt.Errorf("socks5 dial %s: %w", serverAddr, err)
 	}
 
-	mtu := hybrid.SocksMTU()
 	log.Printf("SOCKS uplink: KCP MTU %d (clientIDLen=%d icmpID=%#x)", mtu, cfg.ClientIDLen, cfg.IcmpID)
 
 	pconn, err := hybrid.NewSocksClientConn(tcpConn, cfg)
@@ -205,6 +204,7 @@ func main() {
 	var verbose bool
 	var broadcast int
 	var socksAddr, tcpServer string
+	var socksMTU int
 
 	defCfg := hybrid.DefaultConfig()
 	var clientIDLen, icmpID, maxLabelLen int
@@ -213,6 +213,7 @@ func main() {
 	flag.Var(&udpAddrs, "udp", "UDP DNS resolver address (repeatable for round-robin)")
 	flag.StringVar(&socksAddr, "socks5", "", "SOCKS5 proxy address for TCP uplink (host:port)")
 	flag.StringVar(&tcpServer, "tcp-server", "", "server TCP address for SOCKS uplink (host:port); required with -socks5")
+	flag.IntVar(&socksMTU, "mtu", hybrid.SocksMTU(), "KCP MTU for SOCKS uplink")
 	flag.StringVar(&pubkeyFile, "pubkey-file", "", "server public key file")
 	flag.StringVar(&pubkeyHex, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
 	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "bytes used as DNS/ICMP session ID (must match server)")
@@ -282,7 +283,7 @@ func main() {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
 		}
-		if err := runSocks(pubkey, localAddr, socksAddr, tcpServer, cfg); err != nil {
+		if err := runSocks(pubkey, localAddr, socksAddr, tcpServer, socksMTU, cfg); err != nil {
 			log.Fatal(err)
 		}
 		return

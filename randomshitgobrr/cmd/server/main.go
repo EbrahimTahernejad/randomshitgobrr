@@ -151,7 +151,7 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 // When dnsConn is non-nil, DNS-uplink clients are served on it (domain is required).
 // When tcpLn is non-nil, SOCKS-uplink clients are served on it (domain unused).
 // Both can run simultaneously sharing the same KCP listener and downstream transport.
-func run(privkey []byte, domain dns.Name, destIP net.IP, spoofSrcIP net.IP, upstream string, dnsConn net.PacketConn, tcpLn net.Listener, cfg hybrid.Config) error {
+func run(privkey []byte, domain dns.Name, destIP net.IP, spoofSrcIP net.IP, upstream string, dnsConn net.PacketConn, tcpLn net.Listener, socksMTU int, cfg hybrid.Config) error {
 	if dnsConn != nil {
 		defer dnsConn.Close()
 	}
@@ -163,7 +163,7 @@ func run(privkey []byte, domain dns.Name, destIP net.IP, spoofSrcIP net.IP, upst
 	// When both are active, use the DNS MTU (smaller) so all KCP sessions are compatible.
 	mtu := cfg.MaxKCPMTU()
 	if dnsConn == nil {
-		mtu = hybrid.SocksMTU()
+		mtu = socksMTU
 	}
 	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d recordType=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType)
 	log.Printf("server pubkey %x", noise.PubkeyFromPrivkey(privkey))
@@ -258,6 +258,8 @@ func main() {
 	flag.StringVar(&privkeyHex, "privkey", "", "server private key (hex)")
 	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen for DNS-uplink clients")
 	flag.StringVar(&tcpAddr, "tcp", "", "TCP address to listen for SOCKS-uplink clients")
+	var socksMTU int
+	flag.IntVar(&socksMTU, "mtu", hybrid.SocksMTU(), "KCP MTU for SOCKS uplink")
 	flag.StringVar(&destIPStr, "dest-ip", "", "client's public IPv4 address to send downstream traffic to (required)")
 	flag.StringVar(&spoofSrcStr, "spoof-src", "", "spoofed source IP for downstream ICMP/UDP (leave empty for normal send)")
 	var udpPort int
@@ -399,7 +401,7 @@ func main() {
 		UDPSrcPort:  udpSrcPort,
 		Verbose:     verbose,
 	}
-	if err := run(privkey, domain, destIP, spoofSrcIP, upstream, dnsConn, tcpLn, cfg); err != nil {
+	if err := run(privkey, domain, destIP, spoofSrcIP, upstream, dnsConn, tcpLn, socksMTU, cfg); err != nil {
 		log.Fatal(err)
 	}
 }
