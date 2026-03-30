@@ -502,6 +502,75 @@ func responseFor(query *dns.Message, domain dns.Name, recordType uint16) (*dns.M
 	return resp, payload
 }
 
+// ServeTCP accepts TCP connections from SOCKS-uplink clients. Each connection
+// sends [clientID: cfg.ClientIDLen bytes] once, then a stream of
+// [uint16 BE length][KCP data] frames. Packets are fed into ttConn so the
+// same KCP/Noise/SMUX stack handles them alongside any DNS-mode clients.
+//
+// Can run concurrently with RecvLoop for combined DNS+SOCKS operation.
+func (st *ServerTransport) ServeTCP(ln net.Listener) error {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Temporary() {
+				continue
+			}
+			return err
+		}
+		go st.handleTCPConn(conn)
+	}
+}
+
+func (st *ServerTransport) handleTCPConn(conn net.Conn) {
+	defer conn.Close()
+
+	// First ClientIDLen bytes identify the session.
+	idBuf := make([]byte, st.cfg.ClientIDLen)
+	if _, err := io.ReadFull(conn, idBuf); err != nil {
+		log.Printf("handleTCPConn: read clientID: %v", err)
+		return
+	}
+	clientID := turbotunnel.ClientID(idBuf)
+
+	st.mu.Lock()
+	if _, known := st.clientIPs[clientID]; !known {
+		st.clientIPs[clientID] = st.destIP
+		if st.cfg.UDPPort > 0 {
+			go st.udpSendLoop(clientID, st.destIP)
+		} else {
+			go st.icmpSendLoop(clientID, st.destIP)
+		}
+	}
+	st.mu.Unlock()
+
+	proto := "ICMP"
+	if st.cfg.UDPPort > 0 {
+		proto = fmt.Sprintf("UDP:%d", st.cfg.UDPPort)
+	}
+	log.Printf("handleTCPConn: client %x connected, downlink → %s %v", idBuf, proto, st.destIP)
+
+	for {
+		var lenBuf [2]byte
+		if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
+			break
+		}
+		n := binary.BigEndian.Uint16(lenBuf[:])
+		if n == 0 {
+			continue
+		}
+		pkt := make([]byte, n)
+		if _, err := io.ReadFull(conn, pkt); err != nil {
+			break
+		}
+		if st.cfg.Verbose {
+			log.Printf("handleTCPConn: client %x: %d bytes", idBuf, n)
+		}
+		st.ttConn.QueueIncoming(pkt, clientID)
+	}
+
+	log.Printf("handleTCPConn: client %x disconnected", idBuf)
+}
+
 // vaydnsNextPacket reads the next data packet from r using the VayDNS wire
 // format: [datalen:1][data]. Returns io.EOF only when 0 bytes remain in r.
 func vaydnsNextPacket(r *bytes.Reader) ([]byte, error) {

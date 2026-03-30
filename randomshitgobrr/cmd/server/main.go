@@ -1,19 +1,23 @@
 // hybrid-server is the server side of the hybrid DNS+ICMP tunnel.
 //
-// Upstream (client→server): DNS TXT queries on -udp port.
-// Downstream (server→client): ICMP Echo Requests with optional spoofed source IP.
+// Upstream (client→server): DNS TXT queries on -udp port, TCP frames on -tcp port,
+// or both simultaneously.
+// Downstream (server→client): ICMP Echo Requests or spoofed UDP to the client's IP.
 //
 // Usage:
 //
 //	hybrid-server -gen-key [-privkey-file FILE] [-pubkey-file FILE]
-//	hybrid-server -udp ADDR [-privkey-file FILE] [-spoof-src IP] DOMAIN UPSTREAMADDR
+//	hybrid-server (-udp ADDR|-tcp ADDR|both) -dest-ip IP [-privkey-file FILE] [-spoof-src IP] DOMAIN UPSTREAM
+//	hybrid-server -tcp ADDR -dest-ip IP [-privkey-file FILE] [-spoof-src IP] UPSTREAM
 //
-// Example:
+// Examples:
 //
 //	hybrid-server -gen-key -privkey-file server.key -pubkey-file server.pub
 //	hybrid-server -udp :53 -privkey-file server.key -spoof-src 1.1.1.1 t.example.com 127.0.0.1:8000
+//	hybrid-server -tcp :443 -dest-ip 1.2.3.4 -privkey-file server.key 127.0.0.1:8000
+//	hybrid-server -udp :53 -tcp :443 -dest-ip 1.2.3.4 -privkey-file server.key t.example.com 127.0.0.1:8000
 //
-// Requires root: DNS binding on :53 and raw ICMP socket.
+// Requires root: raw ICMP/UDP socket, and port 53 binding if using -udp.
 //
 // On the server, suppress kernel ICMP auto-replies so clients don't see duplicates:
 //
@@ -143,10 +147,24 @@ func acceptSessions(ln *kcp.Listener, privkey []byte, mtu int, upstream string) 
 	}
 }
 
-func run(privkey []byte, domain dns.Name, destIP net.IP, spoofSrcIP net.IP, upstream string, dnsConn net.PacketConn, cfg hybrid.Config) error {
-	defer dnsConn.Close()
+// run starts the server. dnsConn and tcpLn are both optional; at least one must be non-nil.
+// When dnsConn is non-nil, DNS-uplink clients are served on it (domain is required).
+// When tcpLn is non-nil, SOCKS-uplink clients are served on it (domain unused).
+// Both can run simultaneously sharing the same KCP listener and downstream transport.
+func run(privkey []byte, domain dns.Name, destIP net.IP, spoofSrcIP net.IP, upstream string, dnsConn net.PacketConn, tcpLn net.Listener, cfg hybrid.Config) error {
+	if dnsConn != nil {
+		defer dnsConn.Close()
+	}
+	if tcpLn != nil {
+		defer tcpLn.Close()
+	}
 
+	// KCP MTU: DNS mode is constrained by label length; SOCKS mode uses a larger MTU.
+	// When both are active, use the DNS MTU (smaller) so all KCP sessions are compatible.
 	mtu := cfg.MaxKCPMTU()
+	if dnsConn == nil {
+		mtu = hybrid.SocksMTU()
+	}
 	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d recordType=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType)
 	log.Printf("server pubkey %x", noise.PubkeyFromPrivkey(privkey))
 
@@ -169,7 +187,14 @@ func run(privkey []byte, domain dns.Name, destIP net.IP, spoofSrcIP net.IP, upst
 		}
 	}()
 
-	return st.RecvLoop(dnsConn)
+	errc := make(chan error, 2)
+	if dnsConn != nil {
+		go func() { errc <- st.RecvLoop(dnsConn) }()
+	}
+	if tcpLn != nil {
+		go func() { errc <- st.ServeTCP(tcpLn) }()
+	}
+	return <-errc
 }
 
 func readKey(filename string) ([]byte, error) {
@@ -222,7 +247,7 @@ func generateKeypair(privFile, pubFile string) error {
 func main() {
 	var genKey bool
 	var privFile, pubFile, privkeyHex string
-	var udpAddr, destIPStr, spoofSrcStr string
+	var udpAddr, tcpAddr, destIPStr, spoofSrcStr string
 	var verbose bool
 
 	defCfg := hybrid.DefaultConfig()
@@ -231,7 +256,8 @@ func main() {
 	flag.StringVar(&privFile, "privkey-file", "", "server private key file")
 	flag.StringVar(&pubFile, "pubkey-file", "", "server public key file (with -gen-key)")
 	flag.StringVar(&privkeyHex, "privkey", "", "server private key (hex)")
-	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen for DNS queries (required)")
+	flag.StringVar(&udpAddr, "udp", "", "UDP address to listen for DNS-uplink clients")
+	flag.StringVar(&tcpAddr, "tcp", "", "TCP address to listen for SOCKS-uplink clients")
 	flag.StringVar(&destIPStr, "dest-ip", "", "client's public IPv4 address to send downstream traffic to (required)")
 	flag.StringVar(&spoofSrcStr, "spoof-src", "", "spoofed source IP for downstream ICMP/UDP (leave empty for normal send)")
 	var udpPort int
@@ -245,7 +271,12 @@ func main() {
 	flag.StringVar(&recordTypeStr, "record-type", "txt", "DNS query type to accept: txt, cname, a, aaaa, mx, ns, srv (must match client)")
 	flag.BoolVar(&verbose, "verbose", false, "enable per-packet diagnostic logging")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage:\n  %s -gen-key [-privkey-file FILE] [-pubkey-file FILE]\n  %s -udp ADDR -dest-ip IP [-privkey-file FILE] [-spoof-src IP] DOMAIN UPSTREAMADDR\n\n", os.Args[0], os.Args[0])
+		fmt.Fprintf(os.Stderr,
+			"Usage:\n"+
+				"  %s -gen-key [-privkey-file FILE] [-pubkey-file FILE]\n"+
+				"  %s (-udp ADDR|-tcp ADDR|both) -dest-ip IP [-privkey-file FILE] [-spoof-src IP] [DOMAIN] UPSTREAM\n\n"+
+				"  DOMAIN is required when -udp is used; omit for -tcp-only mode.\n\n",
+			os.Args[0], os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -259,16 +290,36 @@ func main() {
 		return
 	}
 
-	if flag.NArg() != 2 {
+	if udpAddr == "" && tcpAddr == "" {
+		fmt.Fprintln(os.Stderr, "at least one of -udp or -tcp required")
 		flag.Usage()
 		os.Exit(1)
 	}
-	domain, err := dns.ParseName(flag.Arg(0))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid domain: %v\n", err)
-		os.Exit(1)
+
+	// When -udp is active, DOMAIN UPSTREAM are the two positional args.
+	// When only -tcp is active, UPSTREAM is the single positional arg.
+	var domain dns.Name
+	var upstream string
+	var err error
+
+	if udpAddr != "" {
+		if flag.NArg() != 2 {
+			flag.Usage()
+			os.Exit(1)
+		}
+		domain, err = dns.ParseName(flag.Arg(0))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "invalid domain: %v\n", err)
+			os.Exit(1)
+		}
+		upstream = flag.Arg(1)
+	} else {
+		if flag.NArg() != 1 {
+			flag.Usage()
+			os.Exit(1)
+		}
+		upstream = flag.Arg(0)
 	}
-	upstream := flag.Arg(1)
 
 	if destIPStr == "" {
 		fmt.Fprintln(os.Stderr, "-dest-ip required")
@@ -307,14 +358,23 @@ func main() {
 		os.Exit(1)
 	}
 
-	if udpAddr == "" {
-		fmt.Fprintln(os.Stderr, "-udp required")
-		os.Exit(1)
+	var dnsConn net.PacketConn
+	if udpAddr != "" {
+		dnsConn, err = net.ListenPacket("udp", udpAddr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
 	}
-	dnsConn, err := net.ListenPacket("udp", udpAddr)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
+
+	var tcpLn net.Listener
+	if tcpAddr != "" {
+		tcpLn, err = net.Listen("tcp", tcpAddr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		log.Printf("TCP listener on %s (SOCKS uplink)", tcpAddr)
 	}
 
 	recordType, err := hybrid.ParseRecordType(recordTypeStr)
@@ -339,7 +399,7 @@ func main() {
 		UDPSrcPort:  udpSrcPort,
 		Verbose:     verbose,
 	}
-	if err := run(privkey, domain, destIP, spoofSrcIP, upstream, dnsConn, cfg); err != nil {
+	if err := run(privkey, domain, destIP, spoofSrcIP, upstream, dnsConn, tcpLn, cfg); err != nil {
 		log.Fatal(err)
 	}
 }

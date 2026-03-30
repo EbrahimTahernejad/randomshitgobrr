@@ -1,15 +1,20 @@
 // hybrid-client is the client side of the hybrid DNS+ICMP tunnel.
 //
-// Upstream (client→server): DNS TXT queries via DOMAIN.
-// Downstream (server→client): ICMP Echo Requests on the raw socket.
+// Upstream (client→server): DNS TXT queries via DOMAIN, or TCP via a SOCKS5 proxy.
+// Downstream (server→client): ICMP Echo Requests or spoofed UDP on the raw socket.
 //
-// Usage:
+// DNS uplink usage:
 //
 //	hybrid-client [-udp ADDR|-doh URL|-dot ADDR] -pubkey-file FILE DOMAIN LOCALADDR
 //
-// Example:
+// SOCKS uplink usage:
+//
+//	hybrid-client -socks5 PROXY -tcp-server HOST:PORT -pubkey-file FILE LOCALADDR
+//
+// Examples:
 //
 //	hybrid-client -udp 8.8.8.8:53 -pubkey-file server.pub t.example.com 127.0.0.1:7000
+//	hybrid-client -socks5 proxy.corp:1080 -tcp-server 1.2.3.4:443 -pubkey-file server.pub 127.0.0.1:7000
 //
 // Requires root or CAP_NET_RAW for raw ICMP reception.
 package main
@@ -29,6 +34,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/net/proxy"
 	"github.com/user/randomshitgobrr/internal/hybrid"
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
@@ -71,17 +77,9 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	return nil
 }
 
-func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, resolvers []net.Addr, broadcast int, transport net.PacketConn, cfg hybrid.Config) error {
-	defer transport.Close()
-
-	mtu := cfg.MaxKCPMTU()
-	log.Printf("KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d recordType=%d)", mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType)
-
-	pconn, err := hybrid.NewClientConn(transport, resolvers, broadcast, domain, cfg)
-	if err != nil {
-		return fmt.Errorf("hybrid conn: %v", err)
-	}
-
+// runSession sets up KCP → Noise → SMUX over pconn and listens for local TCP
+// connections on localAddr. mtu is the KCP MTU to use.
+func runSession(pconn net.PacketConn, mtu int, pubkey []byte, localAddr *net.TCPAddr) error {
 	conn, err := kcp.NewConn2(turbotunnel.DummyAddr{}, nil, 0, 0, pconn)
 	if err != nil {
 		return fmt.Errorf("KCP conn: %v", err)
@@ -136,6 +134,47 @@ func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, resolvers []net
 	}
 }
 
+// run is the DNS-uplink entry point.
+func run(pubkey []byte, domain dns.Name, localAddr *net.TCPAddr, resolvers []net.Addr, broadcast int, transport net.PacketConn, cfg hybrid.Config) error {
+	defer transport.Close()
+
+	mtu := cfg.MaxKCPMTU()
+	log.Printf("DNS uplink: KCP MTU %d (clientIDLen=%d icmpID=%#x maxLabelLen=%d recordType=%d)",
+		mtu, cfg.ClientIDLen, cfg.IcmpID, cfg.MaxLabelLen, cfg.RecordType)
+
+	pconn, err := hybrid.NewClientConn(transport, resolvers, broadcast, domain, cfg)
+	if err != nil {
+		return fmt.Errorf("hybrid conn: %v", err)
+	}
+
+	return runSession(pconn, mtu, pubkey, localAddr)
+}
+
+// runSocks is the SOCKS-uplink entry point.
+func runSocks(pubkey []byte, localAddr *net.TCPAddr, socksAddr, serverAddr string, cfg hybrid.Config) error {
+	log.Printf("SOCKS uplink: connecting via %s to %s", socksAddr, serverAddr)
+
+	dialer, err := proxy.SOCKS5("tcp", socksAddr, nil, proxy.Direct)
+	if err != nil {
+		return fmt.Errorf("socks5 dialer: %w", err)
+	}
+	tcpConn, err := dialer.Dial("tcp", serverAddr)
+	if err != nil {
+		return fmt.Errorf("socks5 dial %s: %w", serverAddr, err)
+	}
+
+	mtu := hybrid.SocksMTU()
+	log.Printf("SOCKS uplink: KCP MTU %d (clientIDLen=%d icmpID=%#x)", mtu, cfg.ClientIDLen, cfg.IcmpID)
+
+	pconn, err := hybrid.NewSocksClientConn(tcpConn, cfg)
+	if err != nil {
+		tcpConn.Close()
+		return fmt.Errorf("socks client conn: %w", err)
+	}
+
+	return runSession(pconn, mtu, pubkey, localAddr)
+}
+
 func readKey(filename string) ([]byte, error) {
 	f, err := os.Open(filename)
 	if err != nil {
@@ -165,12 +204,15 @@ func main() {
 	var pubkeyFile, pubkeyHex string
 	var verbose bool
 	var broadcast int
+	var socksAddr, tcpServer string
 
 	defCfg := hybrid.DefaultConfig()
 	var clientIDLen, icmpID, maxLabelLen int
 	flag.StringVar(&dohURL, "doh", "", "DNS-over-HTTPS resolver URL")
 	flag.StringVar(&dotAddr, "dot", "", "DNS-over-TLS resolver address")
 	flag.Var(&udpAddrs, "udp", "UDP DNS resolver address (repeatable for round-robin)")
+	flag.StringVar(&socksAddr, "socks5", "", "SOCKS5 proxy address for TCP uplink (host:port)")
+	flag.StringVar(&tcpServer, "tcp-server", "", "server TCP address for SOCKS uplink (host:port); required with -socks5")
 	flag.StringVar(&pubkeyFile, "pubkey-file", "", "server public key file")
 	flag.StringVar(&pubkeyHex, "pubkey", "", fmt.Sprintf("server public key (%d hex digits)", noise.KeyLen*2))
 	flag.IntVar(&clientIDLen, "client-id-len", defCfg.ClientIDLen, "bytes used as DNS/ICMP session ID (must match server)")
@@ -183,28 +225,17 @@ func main() {
 	var udpPort int
 	flag.IntVar(&udpPort, "downstream-udp-port", 0, "listen on this UDP port for downstream from server instead of ICMP (must match server, 0=ICMP)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "Usage: %s [-udp ADDR [-udp ADDR ...]|-doh URL|-dot ADDR] -pubkey-file FILE DOMAIN LOCALADDR\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr,
+			"Usage (DNS uplink):  %s [-udp ADDR ...|-doh URL|-dot ADDR] -pubkey-file FILE DOMAIN LOCALADDR\n"+
+				"Usage (SOCKS uplink): %s -socks5 PROXY -tcp-server HOST:PORT -pubkey-file FILE LOCALADDR\n\n",
+			os.Args[0], os.Args[0])
 		flag.PrintDefaults()
 	}
 	flag.Parse()
 	log.SetFlags(log.LstdFlags | log.LUTC)
 
-	if flag.NArg() != 2 {
-		flag.Usage()
-		os.Exit(1)
-	}
-	domain, err := dns.ParseName(flag.Arg(0))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "invalid domain: %v\n", err)
-		os.Exit(1)
-	}
-	localAddr, err := net.ResolveTCPAddr("tcp", flag.Arg(1))
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-
 	var pubkey []byte
+	var err error
 	switch {
 	case pubkeyFile != "" && pubkeyHex != "":
 		fmt.Fprintln(os.Stderr, "only one of -pubkey and -pubkey-file allowed")
@@ -219,6 +250,57 @@ func main() {
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "pubkey: %v\n", err)
+		os.Exit(1)
+	}
+
+	recordType, err := hybrid.ParseRecordType(recordTypeStr)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	cfg := hybrid.Config{
+		ClientIDLen: clientIDLen,
+		IcmpID:      icmpID,
+		MaxLabelLen: maxLabelLen,
+		RecordType:  recordType,
+		UDPPort:     udpPort,
+		Verbose:     verbose,
+	}
+
+	// ── SOCKS uplink mode ────────────────────────────────────────────────────
+	if socksAddr != "" {
+		if tcpServer == "" {
+			fmt.Fprintln(os.Stderr, "-tcp-server required with -socks5")
+			os.Exit(1)
+		}
+		if flag.NArg() != 1 {
+			flag.Usage()
+			os.Exit(1)
+		}
+		localAddr, err := net.ResolveTCPAddr("tcp", flag.Arg(0))
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := runSocks(pubkey, localAddr, socksAddr, tcpServer, cfg); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+
+	// ── DNS uplink mode ──────────────────────────────────────────────────────
+	if flag.NArg() != 2 {
+		flag.Usage()
+		os.Exit(1)
+	}
+	domain, err := dns.ParseName(flag.Arg(0))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid domain: %v\n", err)
+		os.Exit(1)
+	}
+	localAddr, err := net.ResolveTCPAddr("tcp", flag.Arg(1))
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
 
@@ -255,7 +337,7 @@ func main() {
 		}
 	}
 	if n == 0 {
-		fmt.Fprintln(os.Stderr, "one of -udp, -doh, -dot required")
+		fmt.Fprintln(os.Stderr, "one of -udp, -doh, -dot, -socks5 required")
 		os.Exit(1)
 	}
 	if n > 1 {
@@ -263,19 +345,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	recordType, err := hybrid.ParseRecordType(recordTypeStr)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(1)
-	}
-	cfg := hybrid.Config{
-		ClientIDLen: clientIDLen,
-		IcmpID:      icmpID,
-		MaxLabelLen: maxLabelLen,
-		RecordType:  recordType,
-		UDPPort:     udpPort,
-		Verbose:     verbose,
-	}
 	if err := run(pubkey, domain, localAddr, resolvers, broadcast, transport, cfg); err != nil {
 		log.Fatal(err)
 	}
