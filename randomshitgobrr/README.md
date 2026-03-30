@@ -70,6 +70,7 @@ Copy `server.pub` to the client machine.
 | `-udp` | yes | UDP address to listen for DNS queries |
 | `-dest-ip` | yes | Client's public IPv4 — where to send downstream traffic |
 | `-privkey-file` | recommended | Private key file (omit to generate a temporary key) |
+| `-privkey` | no (alt) | Private key as hex string |
 | `-spoof-src` | no | Source IP to spoof in downstream ICMP/UDP packets. Omit for normal send. |
 | `-downstream-udp-port` | no | Switch downstream from ICMP to raw UDP; client listens on this port. **Must match client.** Default: `0` (ICMP). |
 | `-downstream-udp-src-port` | no | Source port for spoofed downstream UDP packets. Number or `random`. Default: `random`. |
@@ -77,6 +78,7 @@ Copy `server.pub` to the client machine.
 | `-icmp-id` | no | ICMP Echo identifier. Default: `0x5350`. **Must match client.** |
 | `-max-label-len` | no | Max base32 chars per DNS label. Default: `63`. **Must match client.** |
 | `-record-type` | no | DNS query type: `txt`, `cname`, `a`, `aaaa`, `mx`, `ns`, `srv`. Default: `txt`. **Must match client.** |
+| `-verbose` | no | Enable per-packet diagnostic logging. |
 | `DOMAIN` | yes | Tunnel domain (must match NS delegation) |
 | `UPSTREAM` | yes | TCP address to forward tunneled connections to |
 
@@ -118,11 +120,13 @@ echo "net.ipv4.icmp_echo_ignore_all = 1" >> /etc/sysctl.conf && sysctl -p
 | `-dot` | one of three | DNS-over-TLS resolver address |
 | `-broadcast` | no | Number of resolvers to send each packet to. `1` = strict round-robin. Default: `1`. |
 | `-pubkey-file` | yes | Server public key file |
+| `-pubkey` | yes (alt) | Server public key as hex string |
 | `-downstream-udp-port` | no | Listen on this UDP port for downstream from server (instead of ICMP). **Must match server.** Default: `0` (ICMP). |
 | `-client-id-len` | no | Bytes used as session ID. Default: `2`. **Must match server.** |
 | `-icmp-id` | no | ICMP Echo identifier. Default: `0x5350`. **Must match server.** |
 | `-max-label-len` | no | Max base32 chars per DNS label. Default: `63`. **Must match server.** |
 | `-record-type` | no | DNS query type. Default: `txt`. **Must match server.** |
+| `-verbose` | no | Enable per-packet diagnostic logging. |
 | `DOMAIN` | yes | Tunnel domain (must match server) |
 | `LOCALADDR` | yes | Local TCP address to listen on — connect your app here |
 
@@ -230,6 +234,11 @@ hybrid-scanner \
 | `-hs-timeout` | `10s` | Timeout for Noise handshake |
 | `-dns-port` | `53` | DNS port on scanned IPs |
 | `-output` | `results.csv` | Output file |
+| `-client-id-len` | `2` | Session ID length. **Must match server.** |
+| `-icmp-id` | `0x5350` | ICMP Echo identifier. **Must match server.** |
+| `-max-label-len` | `63` | Max base32 chars per DNS label. **Must match server.** |
+| `-record-type` | `txt` | DNS query type. **Must match server.** |
+
 Output format: `ip,latency_ms`
 
 Requires root/`CAP_NET_RAW` (opens a raw ICMP socket per handshake worker).
